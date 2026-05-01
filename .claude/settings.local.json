@@ -1,0 +1,37 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(chmod +x /home/bashperry/rasp_agent/scripts/*.sh)",
+      "Bash(bash scripts/install.sh)",
+      "Bash(curl -s -X POST http://127.0.0.1:11434/api/chat -H 'Content-Type: application/json' -d '{ *)",
+      "Bash(ollama pull *)",
+      "Bash(.venv/bin/python -c \"import rasp_agent; print\\(rasp_agent.__file__\\)\")",
+      "Bash(curl -sf http://127.0.0.1:11434/api/tags)",
+      "Bash(curl -sf http://127.0.0.1:11435/v1/models)",
+      "Bash(timeout 15 *)",
+      "Bash(timeout 90 *)",
+      "Bash(kill 19514 19512)",
+      "Bash(time curl *)",
+      "Bash(rm -f data/db.sqlite data/memory/MEMORY.md data/memory/*.md data/vectors/bm25.sqlite)",
+      "Bash(.venv/bin/python -e \"\" -c \"import rasp_agent.config, rasp_agent.memory.wiki, rasp_agent.memory.consolidate, rasp_agent.agent, rasp_agent.cli; print\\('imports ok'\\)\")",
+      "Bash(.venv/bin/python -c \"import rasp_agent.config, rasp_agent.memory.wiki, rasp_agent.memory.consolidate, rasp_agent.agent, rasp_agent.cli; print\\('imports ok'\\)\")",
+      "Bash(.venv/bin/python *)",
+      "Bash(curl -sI \"https://huggingface.co/bartowski/google_gemma-3n-E2B-it-GGUF/resolve/main/google_gemma-3n-E2B-it-IQ3_XS.gguf\")",
+      "Bash(curl -sI \"https://registry.ollama.ai/v2/library/gemma3n/manifests/e2b\")",
+      "Bash(curl -s \"https://registry.ollama.ai/v2/library/gemma3n/manifests/e2b\")",
+      "Bash(mkdir -p data/gguf)",
+      "Bash(curl -L --fail --connect-timeout 10 -o google_gemma-3n-E2B-it-IQ3_XS.gguf.part 'https://huggingface.co/bartowski/google_gemma-3n-E2B-it-GGUF/resolve/main/google_gemma-3n-E2B-it-IQ3_XS.gguf')",
+      "Bash(ollama create *)",
+      "Bash(ollama list *)",
+      "Bash(ollama show *)",
+      "Bash(ollama rm *)",
+      "Bash(curl -s http://127.0.0.1:11434/api/chat -d '{\"model\":\"gemma3n-e2b-iq3xs\",\"messages\":[{\"role\":\"system\",\"content\":\"be brief\"},{\"role\":\"user\",\"content\":\"hi\"}],\"stream\":false,\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"x\",\"description\":\"y\",\"parameters\":{\"type\":\"object\",\"properties\":{}}}}]}')",
+      "Bash(grep -E \"^---$|warn|error|\\\\\\([0-9]+\\\\.[0-9]+s\\\\\\)\" /tmp/claude-1000/-home-bashperry-rasp-agent/654dc971-7e67-48fe-9808-0cf73dae37b7/tasks/begfj0awm.output)",
+      "Bash(kill -9 20196 20194)",
+      "Bash(curl -s http://127.0.0.1:11434/api/generate -d '{\"model\":\"gemma3n-e2b-iq3xs\",\"prompt\":\"\",\"keep_alive\":-1}')",
+      "Bash(kill 20335 20312)",
+      "Bash(.venv/bin/pip install *)",
+      "Bash(.venv/bin/rasp *)"
+    ]
+  }
+}
