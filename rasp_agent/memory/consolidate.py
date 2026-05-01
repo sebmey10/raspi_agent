@@ -2,13 +2,12 @@
 from __future__ import annotations
 
 import time
-from pathlib import Path
 
 from ..config import CONFIG, Config
 from ..llm import Brain, OllamaClient, TIER_FAST
 from ..prompts import load as load_prompt
 from .store import Store
-from .wiki import DEFAULT_HEADINGS, Section, Wiki, _SECTION_RE
+from .wiki import DEFAULT_HEADINGS, Wiki, _SECTION_RE
 
 
 def _format_transcript(turns: list[dict]) -> str:
@@ -53,6 +52,8 @@ def consolidate(cfg: Config = CONFIG) -> dict:
         num_predict_fast=cfg.num_predict_fast,
         num_predict_reasoner=cfg.num_predict_reasoner,
         num_thread=cfg.num_thread,
+        think_fast=cfg.think_fast,
+        think_reasoner=cfg.think_reasoner,
     )
     try:
         # Use the fast tier for consolidation. The reasoner (gemma3n-e2b-iq3xs)

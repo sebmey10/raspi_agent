@@ -1,4 +1,4 @@
-FROM /home/bashperry/rasp_agent/data/gguf/google_gemma-3n-E2B-it-IQ3_XS.gguf
+FROM ./google_gemma-3n-E2B-it-IQ3_XS.gguf
 TEMPLATE """{{- range $i, $_ := .Messages }}
 {{- $last := eq (len (slice $.Messages $i)) 1 -}}
 <start_of_turn>{{ if eq .Role "user" }}user

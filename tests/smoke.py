@@ -1,5 +1,4 @@
 """End-to-end smoke test: wiki memory + episodic store roundtrip."""
-import time
 
 from rasp_agent.config import CONFIG
 from rasp_agent.memory.store import Store

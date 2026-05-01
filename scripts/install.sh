@@ -23,9 +23,9 @@ if ! curl -sf http://127.0.0.1:11434/api/tags >/dev/null; then
 fi
 
 # 3. Two-tier brain:
-#    - fast: qwen2.5-coder:1.5b (Q4_K_M, ~1 GB resident, fast on Pi NEON).
+#    - fast: qwen3:1.7b (Q4_K_M, strong tool use, thinking disabled by default).
 #    - reasoner: gemma3n-e2b-iq3xs (IQ3_XS, ~2.7 GiB, slower but stronger).
-DEFAULT_FAST="${RASP_MODEL_FAST:-qwen2.5-coder:1.5b}"
+DEFAULT_FAST="${RASP_MODEL_FAST:-qwen3:1.7b}"
 DEFAULT_REASONER="${RASP_MODEL_REASONER:-gemma3n-e2b-iq3xs}"
 
 GGUF_REPO="bartowski/google_gemma-3n-E2B-it-GGUF"
@@ -90,11 +90,7 @@ echo "[rasp] models present:"
 ollama list | sed 's/^/    /'
 
 # Pull fast model
-if [ "$DEFAULT_FAST" = "qwen2.5-coder:1.5b" ]; then
-  ensure_pulled "qwen2.5-coder:1.5b"
-elif ! is_pulled "$DEFAULT_FAST"; then
-  echo "[rasp] WARN: $DEFAULT_FAST not in ollama. Pull it manually."
-fi
+ensure_pulled "$DEFAULT_FAST"
 
 # Build / pull reasoner model
 if [ "$DEFAULT_REASONER" = "$GEMMA3N_TAG" ]; then

@@ -26,6 +26,14 @@ def build_tools(workspace: Path, shell: ShellGate) -> dict[str, Tool]:
     def _edit(args: dict) -> str:
         return fs.edit(workspace, args["path"], args["old"], args["new"])
 
+    def _search(args: dict) -> str:
+        return fs.search(
+            workspace,
+            args["query"],
+            path=args.get("path", "."),
+            max_matches=int(args.get("max_matches", 50)),
+        )
+
     def _bash(args: dict) -> str:
         return shell.run(args["cmd"])
 
@@ -72,6 +80,20 @@ def build_tools(workspace: Path, shell: ShellGate) -> dict[str, Tool]:
                 "required": ["path", "old", "new"],
             },
             handler=_edit,
+        ),
+        "search": Tool(
+            name="search",
+            description="Fast literal text search in the workspace. Prefer this before broad bash grep/find.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "path": {"type": "string", "default": "."},
+                    "max_matches": {"type": "integer", "default": 50},
+                },
+                "required": ["query"],
+            },
+            handler=_search,
         ),
         "bash": Tool(
             name="bash",

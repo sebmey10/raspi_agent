@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass
 from typing import Callable
 
@@ -9,7 +8,7 @@ from .llm import Brain, LLMResponse, TIER_FAST, TIER_REASONER
 from .memory.store import Store
 from .memory.wiki import Wiki
 from .prompts import load as load_prompt
-from .tools.registry import Tool, build_tools
+from .tools.registry import Tool, build_tools, to_ollama_schema
 from .tools.shell import ShellGate
 
 MAX_TOOL_LOOPS = 4
@@ -34,6 +33,7 @@ class Agent:
         self.history: list[dict] = []
         self.fail_streak = 0
         self.forced_tier: str | None = None
+        self.last_turn_stats: list[dict] = []
         self._wire_memory_tools()
 
     def _wire_memory_tools(self) -> None:
@@ -55,13 +55,14 @@ class Agent:
         self.d.tools["remember"].handler = _remember
         self.d.tools["forget"].handler = _forget
 
-    def _system_message(self) -> dict:
+    def _system_message(self, tier: str) -> dict:
         sys_template = load_prompt("system.md")
         body = (
             sys_template
             .replace("{workspace}", str(self.d.cfg.workspace))
             .replace("{wiki}", self.d.wiki.render_for_prompt(self.d.cfg.wiki_prompt_chars))
             .replace("{tools}", self._tools_summary())
+            .replace("{tool_mode}", self._tool_mode_text(tier))
         )
         return {"role": "system", "content": body}
 
@@ -74,6 +75,30 @@ class Agent:
             lines.append(f"- **{name}** — {t.description}")
         return "\n".join(lines)
 
+    def _tool_mode_text(self, tier: str) -> str:
+        if self._use_native_tools(tier):
+            return (
+                "Use Ollama native tool calls when you need a tool. If the model cannot "
+                "emit a native call, fall back to the XML `<tool_call>{...}</tool_call>` "
+                "format exactly."
+            )
+        return (
+            "When you need a tool, emit exactly one XML `<tool_call>{...}</tool_call>` "
+            "block and no other text in that turn."
+        )
+
+    def _use_native_tools(self, tier: str) -> bool:
+        mode = self.d.cfg.native_tools
+        if mode == "off":
+            return False
+        if mode == "on":
+            return True
+        model = self.d.brain.models[tier].lower()
+        return any(
+            marker in model
+            for marker in ("qwen3", "llama3.1", "llama3.2", "llama3.3", "granite", "mistral")
+        )
+
     def _pick_tier(self) -> str:
         if self.forced_tier:
             return self.forced_tier
@@ -81,22 +106,55 @@ class Agent:
             return TIER_REASONER
         return TIER_FAST
 
+    def _context_history(self) -> list[dict]:
+        budget = max(1000, self.d.cfg.history_prompt_chars)
+        max_messages = max(2, self.d.cfg.max_history_messages)
+        kept: list[dict] = []
+        used = 0
+        for msg in reversed(self.history):
+            content = str(msg.get("content", ""))
+            cost = len(content) + 80
+            if kept and (used + cost > budget or len(kept) >= max_messages):
+                break
+            kept.append(msg)
+            used += cost
+        return list(reversed(kept))
+
+    def _clip_tool_result_for_history(self, text: str) -> str:
+        limit = max(500, self.d.cfg.tool_result_chars)
+        if len(text) <= limit:
+            return text
+        return text[:limit] + f"\n<truncated_for_prompt original_chars={len(text)}>"
+
+    def _record_stats(self, resp: LLMResponse) -> None:
+        raw = resp.raw or {}
+        prompt_s = (raw.get("prompt_eval_duration") or 0) / 1_000_000_000
+        eval_s = (raw.get("eval_duration") or 0) / 1_000_000_000
+        load_s = (raw.get("load_duration") or 0) / 1_000_000_000
+        prompt_tokens = raw.get("prompt_eval_count") or 0
+        eval_tokens = raw.get("eval_count") or 0
+        self.last_turn_stats.append({
+            "tier": resp.tier,
+            "model": raw.get("model", self.d.brain.models.get(resp.tier, "")),
+            "prompt_tokens": prompt_tokens,
+            "eval_tokens": eval_tokens,
+            "prompt_tok_s": (prompt_tokens / prompt_s) if prompt_s else 0.0,
+            "eval_tok_s": (eval_tokens / eval_s) if eval_s else 0.0,
+            "load_s": load_s,
+        })
+
     def turn(self, user_msg: str) -> str:
+        self.last_turn_stats = []
         self.d.store.append_turn(self.session_id, "user", user_msg)
         self.history.append({"role": "user", "content": user_msg})
-
-        sys_msg = self._system_message()
-        # We don't send ollama's `tools` field — Gemma 3n's custom Modelfile
-        # template doesn't advertise tool-call support, and the in-prompt
-        # `<tool_call>{...}</tool_call>` format (parsed in llm.py) works on every
-        # model, including ones that lack a tool-aware chat template.
-        tools_schema = None
 
         answer_text = ""
         tier = self._pick_tier()
         seen_calls: dict[tuple[str, str], int] = {}
         for loop in range(MAX_TOOL_LOOPS):
-            messages = [sys_msg] + self.history
+            sys_msg = self._system_message(tier)
+            tools_schema = to_ollama_schema(self.d.tools) if self._use_native_tools(tier) else None
+            messages = [sys_msg] + self._context_history()
             try:
                 resp: LLMResponse = self.d.brain.chat(messages, tools_schema, tier)
             except Exception as e:
@@ -105,6 +163,7 @@ class Agent:
                 self.d.store.append_turn(self.session_id, "assistant", err, tier=tier)
                 return err
 
+            self._record_stats(resp)
             self.history.append({
                 "role": "assistant",
                 "content": resp.content,
@@ -155,7 +214,11 @@ class Agent:
                     self.session_id, "tool", result, tool_name=name,
                     tool_args=args, tool_result=result, tier=tier,
                 )
-                self.history.append({"role": "tool", "name": name, "content": result})
+                self.history.append({
+                    "role": "tool",
+                    "name": name,
+                    "content": self._clip_tool_result_for_history(result),
+                })
 
             if looped:
                 self.history.append({
@@ -165,7 +228,10 @@ class Agent:
                                "without calling any more tools)",
                 })
                 try:
-                    final = self.d.brain.chat([sys_msg] + self.history, None, tier)
+                    final = self.d.brain.chat(
+                        [self._system_message(tier)] + self._context_history(), None, tier
+                    )
+                    self._record_stats(final)
                     answer_text = final.content
                     self.d.store.append_turn(self.session_id, "assistant", answer_text, tier=tier)
                 except Exception as e:
@@ -197,6 +263,8 @@ def build_agent(cfg: Config = CONFIG, on_tool_call=None) -> tuple[Agent, AgentDe
         num_predict_fast=cfg.num_predict_fast,
         num_predict_reasoner=cfg.num_predict_reasoner,
         num_thread=cfg.num_thread,
+        think_fast=cfg.think_fast,
+        think_reasoner=cfg.think_reasoner,
     )
     store = Store(cfg.db_path)
     wiki = Wiki(cfg.wiki_path)
