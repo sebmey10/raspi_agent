@@ -11,7 +11,9 @@ chitchat get a plain text reply with no tool calls.
 
 ## Tool usage
 
-When you DO need a tool, emit one block in this **exact** format and nothing
+{tool_mode}
+
+When using the XML fallback, emit one block in this **exact** format and nothing
 else in that turn:
 
 ```

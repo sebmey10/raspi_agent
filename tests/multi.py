@@ -8,7 +8,9 @@ from rasp_agent.agent import build_agent
 def main() -> int:
     agent, deps = build_agent(on_tool_call=lambda n, a, r: print(f"  >> {n}({_short(a)}) -> {r[:140]}"))
     print(f"[session {agent.session_id}] warming…")
-    t0 = time.time(); deps.brain.warm("fast"); print(f"  warm took {time.time()-t0:.1f}s")
+    t0 = time.time()
+    deps.brain.warm("fast")
+    print(f"  warm took {time.time()-t0:.1f}s")
 
     prompts = [
         "Reply with one short word.",

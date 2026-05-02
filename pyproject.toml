@@ -33,3 +33,7 @@ include-package-data = true
 
 [tool.setuptools.package-data]
 "rasp_agent.prompts" = ["*.md"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
