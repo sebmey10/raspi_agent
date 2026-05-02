@@ -22,17 +22,11 @@ if ! curl -sf http://127.0.0.1:11434/api/tags >/dev/null; then
   exit 1
 fi
 
-# 3. Two-tier brain:
-#    - fast: qwen3:1.7b (Q4_K_M, strong tool use, thinking disabled by default).
-#    - reasoner: gemma3n-e2b-iq3xs (IQ3_XS, ~2.7 GiB, slower but stronger).
+# 3. Two-tier brain (both Qwen3 Q4_K_M for shared tool-call format on ARM):
+#    - fast:     qwen3:1.7b (~1.4 GiB resident, ~10-13 tok/s on Pi 5)
+#    - reasoner: qwen3:4b   (~3.5 GiB resident, ~5-6 tok/s,  /think capable)
 DEFAULT_FAST="${RASP_MODEL_FAST:-qwen3:1.7b}"
-DEFAULT_REASONER="${RASP_MODEL_REASONER:-gemma3n-e2b-iq3xs}"
-
-GGUF_REPO="bartowski/google_gemma-3n-E2B-it-GGUF"
-GGUF_FILE="google_gemma-3n-E2B-it-IQ3_XS.gguf"
-GGUF_DIR="$ROOT/data/gguf"
-GGUF_PATH="$GGUF_DIR/$GGUF_FILE"
-GEMMA3N_TAG="gemma3n-e2b-iq3xs"
+DEFAULT_REASONER="${RASP_MODEL_REASONER:-qwen3:4b}"
 
 is_pulled() {
   ollama list | awk 'NR>1 {print $1}' | grep -qx "$1"
@@ -48,55 +42,12 @@ ensure_pulled() {
   fi
 }
 
-ensure_gemma3n_iq3xs() {
-  if is_pulled "$GEMMA3N_TAG"; then
-    echo "[rasp] $GEMMA3N_TAG already registered"
-    return
-  fi
-  echo "[rasp] $GEMMA3N_TAG not found — importing IQ3_XS GGUF…"
-  mkdir -p "$GGUF_DIR"
-  if [ ! -f "$GGUF_PATH" ]; then
-    echo "[rasp] downloading $GGUF_FILE from $GGUF_REPO (~2.2 GB)…"
-    curl -L --fail \
-      "https://huggingface.co/$GGUF_REPO/resolve/main/$GGUF_FILE" \
-      -o "$GGUF_PATH.part"
-    mv "$GGUF_PATH.part" "$GGUF_PATH"
-  fi
-  local mf="$GGUF_DIR/Modelfile.$GEMMA3N_TAG"
-  # Gemma uses <start_of_turn>/<end_of_turn> framing — declare both as stop
-  # tokens so the model stops cleanly under ollama's chat API.
-  cat >"$mf" <<MFEOF
-FROM $GGUF_PATH
-TEMPLATE """{{- range \$i, \$_ := .Messages }}
-{{- \$last := eq (len (slice \$.Messages \$i)) 1 -}}
-<start_of_turn>{{ if eq .Role "user" }}user
-{{ else if eq .Role "system" }}user
-{{ else }}model
-{{ end }}{{ .Content }}<end_of_turn>
-{{ if and \$last (ne .Role "assistant") }}<start_of_turn>model
-{{ end }}
-{{- end }}"""
-PARAMETER num_ctx 8192
-PARAMETER temperature 0.2
-PARAMETER repeat_penalty 1.1
-PARAMETER stop "<start_of_turn>"
-PARAMETER stop "<end_of_turn>"
-MFEOF
-  ollama create "$GEMMA3N_TAG" -f "$mf"
-  echo "[rasp] $GEMMA3N_TAG created"
-}
-
 echo "[rasp] models present:"
 ollama list | sed 's/^/    /'
 
-# Pull fast model
 ensure_pulled "$DEFAULT_FAST"
-
-# Build / pull reasoner model
-if [ "$DEFAULT_REASONER" = "$GEMMA3N_TAG" ]; then
-  ensure_gemma3n_iq3xs
-elif [ "$DEFAULT_REASONER" != "$DEFAULT_FAST" ] && ! is_pulled "$DEFAULT_REASONER"; then
-  echo "[rasp] WARN: reasoner $DEFAULT_REASONER not in ollama. Pull it manually."
+if [ "$DEFAULT_REASONER" != "$DEFAULT_FAST" ]; then
+  ensure_pulled "$DEFAULT_REASONER"
 fi
 
 # 4. Python venv
@@ -123,9 +74,13 @@ cat <<EOF
   data dir      : $ROOT/data
   wiki          : $ROOT/data/memory/WIKI.md
 
+Pi 5 8GB tuning — strongly recommended for inference speed and stability:
+    bash $ROOT/scripts/tune-pi.sh         # CPU governor, swappiness, ollama unit hints
+
 Run:
     source $ROOT/.venv/bin/activate
-    rasp
+    rasp --doctor                         # verify environment
+    rasp                                  # interactive REPL
 
 Nightly dream consolidation (systemd user timer at 03:00):
     bash $ROOT/scripts/install-dream-timer.sh

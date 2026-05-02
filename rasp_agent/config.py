@@ -72,13 +72,12 @@ class Config:
     workspace: Path = field(default_factory=lambda: _env_path("RASP_WORKSPACE", DEFAULT_WORKSPACE))
 
     ollama_url: str = field(default_factory=lambda: os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434"))
-    # Pi 5 reality check:
-    #   - Q4_K_M class quants are the best fast default on ARM NEON.
-    #   - Qwen3 adds stronger tool use plus controllable thinking; keep it in
-    #     non-thinking mode for normal turns so prompt eval dominates less.
-    #   - Gemma 3n IQ3_XS stays useful as the escalation model, but is slower.
+    # Pi 5 8GB defaults — Q4_K_M for both tiers. Qwen3 family for shared
+    # tool-call format and KV-cache friendliness. Reasoner runs ~5-6 tok/s; fast
+    # ~10-13 tok/s. Stay clear of IQ-quants on ARM CPU — they are arithmetic
+    # heavy and degrade tool-call reliability at <=4B.
     model_fast: str = field(default_factory=lambda: os.environ.get("RASP_MODEL_FAST", "qwen3:1.7b"))
-    model_reasoner: str = field(default_factory=lambda: os.environ.get("RASP_MODEL_REASONER", "gemma3n-e2b-iq3xs"))
+    model_reasoner: str = field(default_factory=lambda: os.environ.get("RASP_MODEL_REASONER", "qwen3:4b"))
 
     ctx_fast: int = field(default_factory=lambda: _env_int("RASP_CTX_FAST", 2048))
     ctx_reasoner: int = field(default_factory=lambda: _env_int("RASP_CTX_REASONER", 4096))

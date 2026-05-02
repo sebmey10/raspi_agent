@@ -31,45 +31,48 @@ A nightly `dream` pass rewrites the wiki tighter.
 
 ## Hardware target
 
-Raspberry Pi 5, 8 GB RAM, Debian 13. Two-tier brain that respects what Pi NEON
-is good at:
+Raspberry Pi 5, 8 GB RAM, Debian 13. Two Qwen3 Q4_K_M tiers — same tool-call
+format, no IQ-quant arithmetic penalty on ARM:
 
-| tier      | model                          | resident | first turn (cold) | warm turn |
-|-----------|--------------------------------|---------:|------------------:|----------:|
-| fast      | `qwen3:1.7b` (Q4_K_M, no-think) | ~1.4 GiB |              ~60s |     ~1-4s |
-| reasoner  | `gemma3n-e2b-iq3xs` (IQ3_XS)   | ~2.7 GiB |             ~250s |    ~5-30s |
+| tier      | model         | resident | first turn (cold) | warm turn |
+|-----------|---------------|---------:|------------------:|----------:|
+| fast      | `qwen3:1.7b`  | ~1.4 GiB |              ~60s |     ~1-4s |
+| reasoner  | `qwen3:4b`    | ~3.5 GiB |             ~120s |    ~5-30s |
 
-`qwen3:1.7b` is the default fast tier because it is still a small Q4_K_M
-model, but has much better agent/tool behavior than the older Qwen2.5-Coder
-tiny model. `rasp` sends `think=false` for the fast tier by default to keep
-latency low. The reasoner is `gemma3n-e2b-iq3xs`, imported via `ollama create`
-from bartowski's IQ3_XS GGUF of `google/gemma-3n-E2B-it` (~2.17 GB on disk,
-~2.7 GiB resident). It's only used when the agent escalates after repeated
-failures, since IQ-quants are arithmetic-heavy and noticeably slower on Pi CPU.
+`qwen3:1.7b` ranks #1 on the public small-model tool-calling benchmark and has
+a 1.000 restraint score (correctly declines to call tools when not needed),
+which is what kills most small-agent loops. `qwen3:4b` shares the same chat
+template and tool format and supports `/think` mode for harder turns. Both run
+~10-13 and ~5-6 tok/s respectively on a Pi 5 with `performance` governor.
 
-> **Why not stock `gemma3n:e2b` from ollama's library?** That tag ships
-> Q4-class weights at ~5.6 GB on disk and ~6 GiB resident — too tight on a
-> Pi 5 8 GB once the agent process is running. IQ3_XS uses llama.cpp's
-> importance-matrix-guided 3-bit quantization, which gets noticeably better
-> perplexity than plain Q3_K_S at the same byte budget.
+Avoid IQ3 quants for agentic use on ARM CPU: the arithmetic is heavier than
+Q4_K_M, and tool-call reliability degrades noticeably below 4B at IQ3.
 
 ## Install
 
 ```bash
-bash scripts/install.sh         # downloads the GGUF and runs `ollama create`
+bash scripts/install.sh         # pulls qwen3:1.7b and qwen3:4b
+bash scripts/tune-pi.sh         # Pi 5 perf tuning (governor, swappiness, ollama unit)
 source .venv/bin/activate
+rasp --doctor                   # verify
 rasp
 ```
 
 The install script will:
 1. Verify `ollama serve` is running on `127.0.0.1:11434`.
-2. Pull the fast model (`qwen3:1.7b` unless `RASP_MODEL_FAST` is set).
-3. Download `google_gemma-3n-E2B-it-IQ3_XS.gguf` from HuggingFace
-   (`bartowski/google_gemma-3n-E2B-it-GGUF`) into `data/gguf/` if missing.
-4. `ollama create gemma3n-e2b-iq3xs -f data/gguf/Modelfile.gemma3n-e2b-iq3xs`
-   with a Gemma chat-format `TEMPLATE` and `<start_of_turn>` / `<end_of_turn>`
-   stop tokens.
-5. Create the venv and `pip install -e .`.
+2. Pull `qwen3:1.7b` (or `RASP_MODEL_FAST`).
+3. Pull `qwen3:4b` (or `RASP_MODEL_REASONER`).
+4. Create the venv and `pip install -e .`.
+
+The tune script (`scripts/tune-pi.sh`) sets `cpufreq=performance`,
+`vm.swappiness=1`, and writes a systemd drop-in for the `ollama.service` unit
+with `LimitMEMLOCK=infinity`, `OLLAMA_KEEP_ALIVE=-1`, `OLLAMA_NUM_PARALLEL=1`,
+`OLLAMA_MAX_LOADED_MODELS=1`. Idempotent; pass `--revert` to undo.
+
+> **Upgrading from older versions:** the reasoner default changed from
+> `gemma3n-e2b-iq3xs` (IQ3_XS, slower on ARM) to `qwen3:4b`. If you want the
+> old default, set `RASP_MODEL_REASONER=gemma3n-e2b-iq3xs` and pull/create
+> the model yourself.
 
 Useful first checks:
 
@@ -119,7 +122,7 @@ data/
 | `RASP_WORKSPACE` | `~/rasp_agent_ws` | where the agent reads/writes files |
 | `OLLAMA_URL` | `http://127.0.0.1:11434` | ollama daemon |
 | `RASP_MODEL_FAST` | `qwen3:1.7b` | default brain |
-| `RASP_MODEL_REASONER` | `gemma3n-e2b-iq3xs` | escalation brain |
+| `RASP_MODEL_REASONER` | `qwen3:4b` | escalation brain |
 | `RASP_NATIVE_TOOLS` | `auto` | `auto`, `on`, or `off` for Ollama tool calls |
 | `RASP_THINK_FAST` | `false` | disable Qwen3 thinking for fast turns |
 | `RASP_CTX_FAST` | `2048` | fast-tier context window |
@@ -129,14 +132,21 @@ data/
 
 ## Notes on quantization
 
-- `TurboQuant` was researched and is currently unverifiable (no paper, no repo).
-  The closest practical "rotate-then-quantize" methods are
-  [QuaRot](https://arxiv.org/abs/2404.00456),
-  [QuIP#](https://arxiv.org/abs/2402.04396), and
-  [SpinQuant](https://arxiv.org/abs/2405.16606), none of which currently target
-  ARM64 + ollama.
-- llama.cpp's IQ-quants (IQ2_XS, IQ3_XS, IQ4_XS) use an imatrix-guided
-  k-quant scheme that is the best practical fit for a Pi today.
-- If you want a smaller model still, swap the GGUF in
-  `data/gguf/Modelfile.gemma3n-e2b-iq3xs` for `IQ2_XS` (~1.9 GB, lower quality)
-  or move up to `IQ4_XS` (~2.6 GB) if you have RAM headroom.
+- Q4_K_M is the production sweet spot on Pi 5 NEON. ARM dotprod accelerates the
+  4-bit matrix kernels; IQ3/IQ2 schemes win in bytes but lose ~15-30% on
+  generation throughput because the imatrix-style decode is arithmetic-heavy
+  on a CPU.
+- For models <=4B parameters, IQ3 quantization noticeably degrades
+  tool-call reliability — small models have less precision headroom. Stay on
+  Q4_K_M unless RAM is genuinely tight.
+- If you have ~5GB headroom and want quality over speed, try `qwen3:4b` Q5_K_M
+  via `ollama pull qwen3:4b-q5_K_M` (or whatever tag the registry exposes).
+
+## Acknowledgements
+
+- Tool-calling rankings drawn from
+  [MikeVeerman/tool-calling-benchmark](https://github.com/MikeVeerman/tool-calling-benchmark).
+- Pi 5 inference numbers cross-checked against
+  [Stratosphere Lab's Pi 5 LLM benchmarks](https://www.stratosphereips.org/blog/2025/6/5/how-well-do-llms-perform-on-a-raspberry-pi-5)
+  and the
+  [SBC inference evaluation paper (arxiv:2511.07425)](https://arxiv.org/html/2511.07425v1).

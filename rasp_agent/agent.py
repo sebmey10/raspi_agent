@@ -11,7 +11,7 @@ from .prompts import load as load_prompt
 from .tools.registry import Tool, build_tools, to_ollama_schema
 from .tools.shell import ShellGate
 
-MAX_TOOL_LOOPS = 4
+MAX_TOOL_LOOPS = 3
 MAX_REPEAT_CALLS = 1  # same (name, args) tuple this many times -> break
 
 
@@ -78,13 +78,13 @@ class Agent:
     def _tool_mode_text(self, tier: str) -> str:
         if self._use_native_tools(tier):
             return (
-                "Use Ollama native tool calls when you need a tool. If the model cannot "
-                "emit a native call, fall back to the XML `<tool_call>{...}</tool_call>` "
-                "format exactly."
+                "Each turn must be EXACTLY ONE of: (a) a single native tool call, or "
+                "(b) a final natural-language answer with no tool calls. Never mix the two."
             )
         return (
-            "When you need a tool, emit exactly one XML `<tool_call>{...}</tool_call>` "
-            "block and no other text in that turn."
+            "Each turn must be EXACTLY ONE of: (a) one `<tool_call>{...}</tool_call>` "
+            "XML block and nothing else, or (b) a final natural-language answer with no "
+            "tool-call block. Never mix the two."
         )
 
     def _use_native_tools(self, tier: str) -> bool:
