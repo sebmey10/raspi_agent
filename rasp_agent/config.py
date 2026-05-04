@@ -107,6 +107,10 @@ class Config:
     bash_timeout: int = field(default_factory=lambda: _env_int("RASP_BASH_TIMEOUT", 30))
 
     dream_min_turns: int = field(default_factory=lambda: _env_int("RASP_DREAM_MIN_TURNS", 4))
+    dream_max_turns: int = field(default_factory=lambda: _env_int("RASP_DREAM_MAX_TURNS", 256))
+    dream_transcript_chars: int = field(
+        default_factory=lambda: _env_int("RASP_DREAM_TRANSCRIPT_CHARS", 24000)
+    )
     wiki_prompt_chars: int = field(default_factory=lambda: _env_int("RASP_WIKI_PROMPT_CHARS", 9000))
     history_prompt_chars: int = field(default_factory=lambda: _env_int("RASP_HISTORY_PROMPT_CHARS", 7000))
     max_history_messages: int = field(default_factory=lambda: _env_int("RASP_MAX_HISTORY_MESSAGES", 16))

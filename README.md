@@ -8,8 +8,8 @@ A nightly `dream` pass rewrites the wiki tighter.
 ## What it is
 
 - **REPL + one-shot CLI** with tool-call tracing (`rich`)
-- **Tools**: `read`, `write`, `edit`, `search`, `bash` (validated allowlist),
-  `web_fetch`, `remember`, `forget`
+- **Tools**: `list_files`, paged `read`, `write`, `edit`, `search`, `bash`
+  (validated allowlist + approval path), `web_fetch`, `remember`, `forget`
 - **Memory** — one canonical file at `data/memory/WIKI.md` with fixed `## H2`
   headings (`Identity`, `User`, `Active Projects`, `Preferences`, `References`,
   `Notes`, `Archive`). The active wiki budget is loaded into the system prompt
@@ -128,6 +128,9 @@ data/
 | `RASP_CTX_FAST` | `2048` | fast-tier context window |
 | `RASP_HISTORY_PROMPT_CHARS` | `7000` | recent transcript budget |
 | `RASP_WIKI_PROMPT_CHARS` | `9000` | wiki memory budget |
+| `RASP_DREAM_MAX_TURNS` | `256` | max transcript turns consumed per dream pass |
+| `RASP_DREAM_TRANSCRIPT_CHARS` | `24000` | dream transcript prompt budget |
+| `RASP_WEB_ALLOW_PRIVATE` | `false` | allow `web_fetch` to reach localhost/private IPs |
 | `RASP_AUTO_DREAM_ON_EXIT` | `false` | run consolidation when the CLI exits |
 
 ## Notes on quantization
