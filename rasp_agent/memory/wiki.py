@@ -36,12 +36,37 @@ DEFAULT_BODY: dict[str, str] = {
     "Archive": "(rotated content from past dream cycles lands here)",
 }
 
+HEADING_ALIASES: dict[str, str] = {
+    "active project": "Active Projects",
+    "active projects": "Active Projects",
+    "project": "Active Projects",
+    "projects": "Active Projects",
+    "preference": "Preferences",
+    "preferences": "Preferences",
+    "pref": "Preferences",
+    "prefs": "Preferences",
+    "reference": "References",
+    "references": "References",
+    "link": "References",
+    "links": "References",
+    "note": "Notes",
+    "notes": "Notes",
+    "user": "User",
+}
+
 # Match any "## Heading" up to the next "## " or EOF.
 _SECTION_RE = re.compile(r"^## ([^\n]+)\n(.*?)(?=^## |\Z)", re.MULTILINE | re.DOTALL)
 
 
 def _normalize(name: str) -> str:
     return name.strip().lower()
+
+
+def atomic_write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{time.time_ns()}.tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(path)
 
 
 @dataclass
@@ -68,13 +93,16 @@ class Wiki:
             out.append(f"## {h}")
             out.append(DEFAULT_BODY.get(h, "(nothing yet)"))
             out.append("")
-        self.path.write_text("\n".join(out).rstrip() + "\n")
+        atomic_write_text(self.path, "\n".join(out).rstrip() + "\n")
 
     def text(self) -> str:
-        return self.path.read_text()
+        return self.path.read_text(encoding="utf-8")
 
     def sections(self) -> list[Section]:
         text = self.text()
+        return self._sections_from_text(text)
+
+    def _sections_from_text(self, text: str) -> list[Section]:
         return [Section(h.strip(), b.strip()) for h, b in _SECTION_RE.findall(text)]
 
     def _save(self, sections: list[Section]) -> None:
@@ -85,7 +113,14 @@ class Wiki:
             out.append(f"## {s.heading}")
             out.append(s.body.strip() if s.body.strip() else "(empty)")
             out.append("")
-        self.path.write_text("\n".join(out).rstrip() + "\n")
+        atomic_write_text(self.path, "\n".join(out).rstrip() + "\n")
+
+    def _canonical_heading(self, heading: str) -> str | None:
+        target = _normalize(heading)
+        for h in self.headings:
+            if _normalize(h) == target:
+                return h
+        return HEADING_ALIASES.get(target)
 
     def find(self, heading: str) -> Section | None:
         target = _normalize(heading)
@@ -99,20 +134,32 @@ class Wiki:
         note = note.strip()
         if not note:
             return "<error>empty note</error>"
+        canonical = self._canonical_heading(heading)
+        if canonical is None:
+            allowed = ", ".join(self.headings)
+            return f"<error>unknown heading {heading!r}; use one of: {allowed}</error>"
         secs = self.sections()
-        target = _normalize(heading)
+        target = _normalize(canonical)
         for s in secs:
             if _normalize(s.heading) == target:
                 body = s.body
                 if body.startswith("(") and body.endswith(")"):
                     body = ""  # replace placeholder
                 bullet = note if note.startswith("- ") else f"- {note}"
+                note_key = _normalize(bullet.removeprefix("- "))
+                existing = {
+                    _normalize(line.strip().removeprefix("- "))
+                    for line in body.splitlines()
+                    if line.strip()
+                }
+                if note_key in existing:
+                    return f"<remembered heading={s.heading!r} duplicate=true/>"
                 s.body = (body.rstrip() + "\n" + bullet).strip()
                 self._save(secs)
                 return f"<remembered heading={s.heading!r} bytes={len(bullet)}/>"
-        secs.append(Section(heading=heading, body=f"- {note}"))
+        secs.append(Section(heading=canonical, body=f"- {note}"))
         self._save(secs)
-        return f"<remembered heading={heading!r} new_section=true/>"
+        return f"<remembered heading={canonical!r} new_section=true/>"
 
     def replace(self, heading: str, body: str) -> str:
         """Replace the entire body under `heading`."""
@@ -167,7 +214,7 @@ class Wiki:
         text = self.text()
         if len(text) <= max_chars:
             return text
-        secs = self.sections()
+        secs = self._sections_from_text(text)
         kept = [s for s in secs if _normalize(s.heading) != "archive"]
         # rebuild without archive
         out = ["# Agent Wiki", ""]

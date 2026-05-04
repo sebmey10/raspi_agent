@@ -9,6 +9,7 @@ from pathlib import Path
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
+from rich.prompt import Confirm
 from rich.table import Table
 
 from .agent import Agent, build_agent
@@ -227,6 +228,7 @@ def _finish(agent: Agent, deps, cfg: Config) -> None:
                 console.print(f"[dim]auto-dream: {res['summary']}[/dim]")
         except Exception as e:
             console.print(f"[yellow]auto-dream failed: {e}[/yellow]")
+    deps.store.close()
     deps.brain.client.close()
 
 
@@ -238,7 +240,17 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_doctor(cfg)
 
     banner(cfg)
-    agent, deps = build_agent(cfg, on_tool_call=render_tool_call)
+    def confirm_shell(cmd: str) -> bool:
+        console.print(Panel(
+            f"[bold]Command requested outside the default shell policy[/bold]\n\n"
+            f"[cyan]{cmd}[/cyan]\n\n"
+            f"[dim]workspace: {cfg.workspace}[/dim]",
+            title="shell approval",
+            border_style="yellow",
+        ))
+        return Confirm.ask("Run it anyway?", default=False)
+
+    agent, deps = build_agent(cfg, on_tool_call=render_tool_call, confirm_callback=confirm_shell)
     _set_tier(agent, args.tier)
     if not args.no_warm:
         deps.brain.warm(agent._pick_tier())

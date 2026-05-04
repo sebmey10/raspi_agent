@@ -18,7 +18,12 @@ class Tool:
 
 def build_tools(workspace: Path, shell: ShellGate) -> dict[str, Tool]:
     def _read(args: dict) -> str:
-        return fs.read(workspace, args["path"], max_lines=int(args.get("max_lines", 2000)))
+        return fs.read(
+            workspace,
+            args["path"],
+            max_lines=int(args.get("max_lines", 2000)),
+            start_line=int(args.get("start_line", 1)),
+        )
 
     def _write(args: dict) -> str:
         return fs.write(workspace, args["path"], args["content"])
@@ -34,6 +39,14 @@ def build_tools(workspace: Path, shell: ShellGate) -> dict[str, Tool]:
             max_matches=int(args.get("max_matches", 50)),
         )
 
+    def _list_files(args: dict) -> str:
+        return fs.list_files(
+            workspace,
+            path=args.get("path", "."),
+            pattern=args.get("pattern", "*"),
+            max_files=int(args.get("max_files", 200)),
+        )
+
     def _bash(args: dict) -> str:
         return shell.run(args["cmd"])
 
@@ -43,16 +56,30 @@ def build_tools(workspace: Path, shell: ShellGate) -> dict[str, Tool]:
     tools: dict[str, Tool] = {
         "read": Tool(
             name="read",
-            description="Read a file (or list a directory). Path is relative to workspace.",
+            description="Read a file page (or list a directory). Path is relative to workspace.",
             parameters={
                 "type": "object",
                 "properties": {
                     "path": {"type": "string"},
                     "max_lines": {"type": "integer", "default": 2000},
+                    "start_line": {"type": "integer", "default": 1},
                 },
                 "required": ["path"],
             },
             handler=_read,
+        ),
+        "list_files": Tool(
+            name="list_files",
+            description="List workspace files by glob pattern. Use this to map a repo before reading.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "default": "."},
+                    "pattern": {"type": "string", "default": "*"},
+                    "max_files": {"type": "integer", "default": 200},
+                },
+            },
+            handler=_list_files,
         ),
         "write": Tool(
             name="write",

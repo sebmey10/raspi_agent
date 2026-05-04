@@ -62,17 +62,28 @@ class Store:
     def __init__(self, db_path: Path):
         self.db_path = db_path
         db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._db: sqlite3.Connection | None = self._open()
         with self._conn() as c:
             c.executescript(SCHEMA)
 
+    def _open(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path, isolation_level=None, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA foreign_keys=ON")
+        return conn
+
     @contextmanager
     def _conn(self) -> Iterator[sqlite3.Connection]:
-        conn = sqlite3.connect(self.db_path, isolation_level=None)
-        conn.row_factory = sqlite3.Row
-        try:
-            yield conn
-        finally:
-            conn.close()
+        if self._db is None:
+            self._db = self._open()
+        yield self._db
+
+    def close(self) -> None:
+        if self._db is not None:
+            self._db.close()
+            self._db = None
 
     def start_session(self, title: str | None = None) -> str:
         sid = uuid.uuid4().hex[:12]
@@ -107,7 +118,7 @@ class Store:
                     role,
                     content,
                     tool_name,
-                    json.dumps(tool_args) if tool_args is not None else None,
+                    json.dumps(tool_args, default=str) if tool_args is not None else None,
                     tool_result,
                     tier,
                 ),
@@ -122,13 +133,19 @@ class Store:
             ).fetchall()
         return [dict(r) for r in reversed(rows)]
 
-    def turns_since(self, since_ts: float) -> list[dict[str, Any]]:
+    def turns_since(self, since_ts: float, limit: int | None = None) -> list[dict[str, Any]]:
+        sql = (
+            "SELECT session_id, ts, role, content, tool_name, tool_args, tool_result "
+            "FROM turns WHERE ts >= ? ORDER BY ts ASC"
+        )
+        params: tuple[Any, ...]
+        if limit is not None:
+            sql += " LIMIT ?"
+            params = (since_ts, max(1, int(limit)))
+        else:
+            params = (since_ts,)
         with self._conn() as c:
-            rows = c.execute(
-                "SELECT session_id, ts, role, content, tool_name, tool_args, tool_result "
-                "FROM turns WHERE ts >= ? ORDER BY ts ASC",
-                (since_ts,),
-            ).fetchall()
+            rows = c.execute(sql, params).fetchall()
         return [dict(r) for r in rows]
 
     def get_kv(self, key: str, default: str | None = None) -> str | None:

@@ -7,21 +7,32 @@ from ..config import CONFIG, Config
 from ..llm import Brain, OllamaClient, TIER_FAST
 from ..prompts import load as load_prompt
 from .store import Store
-from .wiki import DEFAULT_HEADINGS, Wiki, _SECTION_RE
+from .wiki import DEFAULT_HEADINGS, Wiki, _SECTION_RE, atomic_write_text
 
 
-def _format_transcript(turns: list[dict]) -> str:
-    out = []
-    for t in turns:
+def _format_transcript(turns: list[dict], max_chars: int) -> str:
+    out: list[str] = []
+    used = 0
+    omitted = 0
+    for t in reversed(turns):
         role = t["role"]
         content = (t["content"] or "").strip()
         if not content:
             continue
         if role == "tool":
             tn = t.get("tool_name") or "tool"
-            out.append(f"[{tn}-result] {content[:600]}")
+            line = f"[{tn}-result] {content[:600]}"
         else:
-            out.append(f"[{role}] {content[:1200]}")
+            line = f"[{role}] {content[:1200]}"
+        cost = len(line) + 1
+        if out and used + cost > max_chars:
+            omitted += 1
+            continue
+        out.append(line)
+        used += cost
+    out.reverse()
+    if omitted:
+        out.insert(0, f"[system] omitted {omitted} older transcript item(s) over budget")
     return "\n".join(out)
 
 
@@ -31,14 +42,15 @@ def consolidate(cfg: Config = CONFIG) -> dict:
     wiki = Wiki(cfg.wiki_path)
 
     last_run = float(store.get_kv("last_dream_ts") or 0.0)
-    turns = store.turns_since(last_run)
+    turns = store.turns_since(last_run, limit=cfg.dream_max_turns)
     if len(turns) < cfg.dream_min_turns:
+        store.close()
         return {
             "skipped": True,
             "reason": f"only {len(turns)} new turns (< {cfg.dream_min_turns})",
         }
 
-    transcript = _format_transcript(turns)
+    transcript = _format_transcript(turns, max(1000, cfg.dream_transcript_chars))
     prompt = (
         load_prompt("consolidate.md")
         .replace("{wiki}", wiki.text())
@@ -56,10 +68,8 @@ def consolidate(cfg: Config = CONFIG) -> dict:
         think_reasoner=cfg.think_reasoner,
     )
     try:
-        # Use the fast tier for consolidation. The reasoner (gemma3n-e2b-iq3xs)
-        # is both slower *and* lower-quality for long structured rewrites on a
-        # Pi — qwen2.5-coder:1.5b at Q4_K_M produces a coherent wiki diff in a
-        # fraction of the time.
+        # Use the fast tier for consolidation: the rewrite is bounded and
+        # structure-heavy, so keeping prompt cost low matters more than depth.
         resp = brain.chat(
             messages=[{"role": "user", "content": prompt}],
             tools=None,
@@ -76,12 +86,14 @@ def consolidate(cfg: Config = CONFIG) -> dict:
     written = 0
     if cleaned and len(cleaned) > 200:
         wiki.snapshot(cfg.wiki_snapshots_dir)
-        cfg.wiki_path.write_text(cleaned)
+        atomic_write_text(cfg.wiki_path, cleaned)
         written = 1
         summary = f"Rewrote wiki ({len(cleaned)} chars)."
 
     store.log_dream(summary=summary, turns_consumed=len(turns), memories_written=written)
-    store.set_kv("last_dream_ts", str(time.time()))
+    last_processed = max(float(t["ts"]) for t in turns)
+    store.set_kv("last_dream_ts", str(last_processed))
+    store.close()
 
     return {
         "skipped": False,
