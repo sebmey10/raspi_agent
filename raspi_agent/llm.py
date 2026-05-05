@@ -126,13 +126,31 @@ def _repair_json(text: str) -> str | None:
     if not s:
         return None
     fixed = _TRAILING_COMMA_RE.sub(r"\1", s)
-    open_b = fixed.count("{") - fixed.count("}")
-    open_s = fixed.count("[") - fixed.count("]")
-    if open_b > 0:
-        fixed = fixed + ("}" * open_b)
-    if open_s > 0:
-        fixed = fixed + ("]" * open_s)
-    return fixed
+    return fixed + _missing_json_closers(fixed)
+
+
+def _missing_json_closers(text: str) -> str:
+    stack: list[str] = []
+    in_string = False
+    escape = False
+    pairs = {"{": "}", "[": "]"}
+    for ch in text:
+        if escape:
+            escape = False
+            continue
+        if ch == "\\" and in_string:
+            escape = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch in pairs:
+            stack.append(pairs[ch])
+        elif ch in ("}", "]") and stack and stack[-1] == ch:
+            stack.pop()
+    return "".join(reversed(stack))
 
 
 def _only_fenced_json(text: str) -> str | None:

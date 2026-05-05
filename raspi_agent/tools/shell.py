@@ -15,6 +15,18 @@ PATHY_COMMANDS = {"cat", "head", "tail", "wc", "grep", "rg", "find", "tree", "se
 PACKAGE_COMMANDS = {"pip", "npm", "pnpm", "yarn"}
 DESTRUCTIVE_GIT = {"clean", "reset", "checkout", "restore", "rebase"}
 NET_COMMANDS = {"curl", "wget", "git"}  # need --share-net under bwrap
+SENSITIVE_FILENAMES = {
+    ".env",
+    ".env.local",
+    ".envrc",
+    ".npmrc",
+    ".pypirc",
+    ".netrc",
+    "id_rsa",
+    "id_dsa",
+    "id_ecdsa",
+    "id_ed25519",
+}
 
 
 class ShellGate:
@@ -200,6 +212,8 @@ class ShellGate:
                     return f"curl local/private target requires confirmation: {arg}"
         if command in PATHY_COMMANDS or command in {"python", "python3", "node"}:
             for arg in args:
+                if self._path_arg_is_sensitive(arg):
+                    return f"sensitive path requires explicit opt-in: {arg}"
                 if self._path_arg_escapes_workspace(arg):
                     return f"path argument escapes workspace: {arg}"
         return None
@@ -215,6 +229,16 @@ class ShellGate:
         except OSError:
             return False
         return resolved != ws and ws not in resolved.parents
+
+    def _path_arg_is_sensitive(self, arg: str) -> bool:
+        if _allow_secrets() or not arg or arg.startswith("-") or "://" in arg:
+            return False
+        raw = Path(arg).expanduser()
+        p = raw if raw.is_absolute() else self.workspace / raw
+        name = p.name.lower()
+        if name in SENSITIVE_FILENAMES or name.endswith((".pem", ".key", ".p12", ".pfx")):
+            return True
+        return any(part.lower() in {".ssh", ".gnupg"} for part in p.parts)
 
     def _curl_target_is_local(self, arg: str) -> bool:
         if arg.startswith("-"):
@@ -255,3 +279,10 @@ def _looks_like_path(token: str) -> bool:
     if token in {".", ".."}:
         return True
     return token.startswith(("/", "~/", "./", "../")) or "/" in token
+
+
+def _allow_secrets() -> bool:
+    for var in ("RASPI_ALLOW_SECRETS", "RASP_ALLOW_SECRETS"):
+        if os.environ.get(var, "").strip().lower() in {"1", "true", "yes", "on"}:
+            return True
+    return False

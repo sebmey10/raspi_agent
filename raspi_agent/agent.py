@@ -29,6 +29,7 @@ REFLECT_PROMPT = (
     "[reflect-checkpoint] Reply with ONE word: `keep`, `replan`, or `give_up`. "
     "Do not call any tools. Do not write anything else."
 )
+INSTRUCTION_FILES = ("AGENTS.md", "RASPI.md")
 
 
 @dataclass
@@ -95,9 +96,31 @@ class Agent:
                 note = str(note)
             return self.d.scratch.write_plan(steps, note)
 
+        def _context_update(args: dict) -> str:
+            section = str(args.get("section") or "Decisions")
+            note = str(args.get("note") or "").strip()
+            if not note:
+                return "<error>missing field: note</error>"
+            return self.d.scratch.update_context(section, note)
+
+        def _todo_update(args: dict) -> str:
+            return self.d.scratch.update_plan_step(
+                int(args.get("step", 0)),
+                str(args.get("status") or ""),
+                args.get("note"),
+            )
+
         self.d.tools["remember"].handler = _remember
         self.d.tools["forget"].handler = _forget
         self.d.tools["todo_write"].handler = _todo_write
+        self.d.tools["todo_update"].handler = _todo_update
+        self.d.tools["context_update"].handler = _context_update
+
+    def install_tool(self, tool: Tool) -> None:
+        """Add a runtime-scoped tool and invalidate prompt/schema caches."""
+        self.d.tools[tool.name] = tool
+        self._tools_summary_cache = None
+        self._tools_schema_cache = None
 
     # ---- prompt assembly ----
 
@@ -107,6 +130,8 @@ class Agent:
             .replace("{workspace}", str(self.d.cfg.workspace))
             .replace("{wiki}", self._wiki_for_prompt())
             .replace("{plan}", self._plan_for_prompt())
+            .replace("{context}", self._context_for_prompt())
+            .replace("{repo_instructions}", self._repo_instructions_for_prompt())
             .replace("{tools}", self._tools_summary())
             .replace("{tool_mode}", self._tool_mode_text(tier))
         )
@@ -127,6 +152,35 @@ class Agent:
 
     def _plan_for_prompt(self) -> str:
         return self.d.scratch.render_for_prompt(self.d.cfg.plan_prompt_chars)
+
+    def _context_for_prompt(self) -> str:
+        return self.d.scratch.render_context_for_prompt(self.d.cfg.context_prompt_chars)
+
+    def _repo_instructions_for_prompt(self) -> str:
+        found: list[str] = []
+        workspace = self.d.cfg.workspace.resolve()
+        candidates = [workspace, *workspace.parents]
+        for base in candidates[:4]:
+            for name in INSTRUCTION_FILES:
+                p = base / name
+                if not p.is_file():
+                    continue
+                try:
+                    text = p.read_text(encoding="utf-8", errors="replace").strip()
+                except OSError:
+                    continue
+                if text:
+                    rel = str(p)
+                    try:
+                        rel = str(p.relative_to(workspace))
+                    except ValueError:
+                        pass
+                    found.append(f"## {rel}\n{text[:self.d.cfg.repo_instructions_chars]}")
+        if not found:
+            return "_(none found)_"
+        body = "\n\n".join(found)
+        limit = max(500, self.d.cfg.repo_instructions_chars)
+        return body if len(body) <= limit else body[:limit] + "\n…\n_(repo instructions truncated)_"
 
     def _tools_summary(self) -> str:
         if self._tools_summary_cache is not None:
@@ -278,6 +332,9 @@ class Agent:
         if missing:
             return clean, f"<error>missing required field(s): {', '.join(missing)}</error>"
         props = tool.parameters.get("properties", {})
+        unknown = sorted(set(clean) - set(props))
+        if unknown:
+            return clean, f"<error>unknown field(s): {', '.join(unknown)}</error>"
         for name, schema in props.items():
             if name not in clean:
                 continue
@@ -287,10 +344,17 @@ class Agent:
                     clean[name] = int(clean[name])
                 except (TypeError, ValueError):
                     return clean, f"<error>field {name} must be an integer</error>"
+                if "minimum" in schema and clean[name] < schema["minimum"]:
+                    return clean, f"<error>field {name} must be >= {schema['minimum']}</error>"
+                if "maximum" in schema and clean[name] > schema["maximum"]:
+                    return clean, f"<error>field {name} must be <= {schema['maximum']}</error>"
             elif t == "string" and not isinstance(clean[name], str):
                 clean[name] = str(clean[name])
             elif t == "array" and not isinstance(clean[name], list):
                 return clean, f"<error>field {name} must be an array</error>"
+            if "enum" in schema and clean[name] not in schema["enum"]:
+                allowed = ", ".join(map(str, schema["enum"]))
+                return clean, f"<error>field {name} must be one of: {allowed}</error>"
         return clean, None
 
     def _tool_result_failed(self, result: str) -> bool:
@@ -327,6 +391,8 @@ class Agent:
                     answer_text = self._final_answer(tier, "you chose `give_up`")
                     exhausted = False
                     break
+                if decision == "replan":
+                    self._request_replan(tier)
 
             sys_msg = self._system_message(tier)
             using_native_tools = self._use_native_tools(tier)
@@ -393,8 +459,13 @@ class Agent:
                         except Exception as e:
                             result = f"<error>{type(e).__name__}: {e}</error>"
                             any_failed = True
-                if self._tool_result_failed(result):
+                failed = self._tool_result_failed(result)
+                if failed:
                     any_failed = True
+                try:
+                    self.d.store.record_tool_result(name, not failed)
+                except Exception:
+                    pass
 
                 self.session_stats["tool_calls"] += 1
                 if self.d.on_tool_call:
@@ -453,6 +524,15 @@ class Agent:
             if choice in text:
                 return choice
         return "keep"
+
+    def _request_replan(self, tier: str) -> None:
+        msg = (
+            "(system: reflect chose `replan`; your next action must be a "
+            "`todo_write` call with a corrected plan for the original user task. "
+            "Do not continue with any other tool until the plan is replaced.)"
+        )
+        self.history.append({"role": "user", "content": msg})
+        self.d.store.append_turn(self.session_id, "user", msg, tier=tier)
 
     def _final_answer(self, tier: str, reason: str) -> str:
         self.history.append({
@@ -537,6 +617,8 @@ def build_agent(
     on_chunk=None,
     confirm_callback=None,
     cancel: threading.Event | None = None,
+    reset_scratch: bool = True,
+    preserve_context: bool = False,
 ) -> tuple[Agent, AgentDeps]:
     cfg.ensure_dirs()
     from .llm import OllamaClient
@@ -553,7 +635,10 @@ def build_agent(
     store = Store(cfg.db_path)
     wiki = Wiki(cfg.wiki_path)
     scratch = Scratchpad.from_workspace(cfg.workspace)
-    scratch.start_session()
+    if reset_scratch:
+        scratch.start_session(preserve_context=preserve_context)
+    else:
+        scratch.prepare()
 
     def confirm(cmd: str) -> bool:
         return bool(confirm_callback and confirm_callback(cmd))

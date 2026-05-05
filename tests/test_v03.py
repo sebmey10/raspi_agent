@@ -38,17 +38,46 @@ def test_scratchpad_replan_preserves_pin(tmp_path: Path):
     assert "1. a" not in second
 
 
+def test_scratchpad_updates_plan_step_status(tmp_path: Path):
+    sp = Scratchpad.from_workspace(tmp_path)
+    sp.start_session()
+    sp.begin_task("ship it")
+    sp.write_plan(["read", "edit"])
+
+    assert sp.update_plan_step(1, "doing", "opened file") == "<plan_step step=1 status=doing/>"
+    assert sp.update_plan_step(1, "done") == "<plan_step step=1 status=done/>"
+    text = sp.plan_path.read_text(encoding="utf-8")
+
+    assert "- [x] 1. read" in text
+    assert "- [ ] 2. edit" in text
+
+
 def test_scratchpad_session_start_clears_old_state(tmp_path: Path):
     sp = Scratchpad.from_workspace(tmp_path)
     sp.start_session()
     sp.begin_task("old task")
     sp.write_plan(["leftover"])
+    sp.update_context("Decisions", "Keep this only for old session")
     assert sp.plan_path.exists()
+    assert sp.context_path.exists()
 
     sp2 = Scratchpad.from_workspace(tmp_path)
     sp2.start_session()
     assert not sp2.plan_path.exists()
+    assert not sp2.context_path.exists()
     assert (tmp_path / ".raspi" / ".gitignore").exists()
+
+
+def test_scratchpad_context_update_dedupes_and_renders(tmp_path: Path):
+    sp = Scratchpad.from_workspace(tmp_path)
+    sp.start_session()
+
+    assert "<context" in sp.update_context("files", "Read README.md")
+    sp.update_context("Files Inspected", "Read README.md")
+    text = sp.render_context_for_prompt(1000)
+
+    assert "## Files Inspected" in text
+    assert text.count("Read README.md") == 1
 
 
 # ---- apply_patch ------------------------------------------------------------

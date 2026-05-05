@@ -35,9 +35,12 @@ def run_checks(cfg: Config) -> list[Check]:
     checks.append(Check("threads", "ok", f"num_thread={cfg.num_thread} cpu_count={os.cpu_count() or 'unknown'}"))
     checks.append(Check("prompt budgets", "ok",
                        f"wiki={cfg.wiki_prompt_chars} plan={cfg.plan_prompt_chars} "
+                       f"context={cfg.context_prompt_chars} "
+                       f"repo_instructions={cfg.repo_instructions_chars} "
                        f"history={cfg.history_prompt_chars} chars"))
     checks.append(Check("tools", "ok",
                        f"native_tools={cfg.native_tools} think_fast={cfg.think_fast!r}"))
+    checks.append(_tool_parser_check())
     checks.append(_sandbox_check(cfg))
     checks.append(_ast_edit_check())
     return checks
@@ -68,6 +71,38 @@ def _ast_edit_check() -> Check:
         return Check("ast_edit", "ok", "tree-sitter Python+JS wheels detected")
     return Check("ast_edit", "warn",
                  "tree-sitter wheels missing; pip install raspi-agent[ast] to enable")
+
+
+def _tool_parser_check() -> Check:
+    try:
+        from .llm import _try_extract_tool_calls_from_text  # noqa: PLC0415 - doctor probe
+    except Exception as e:  # pragma: no cover
+        return Check("tool parser", "fail", f"import failed: {e}")
+    cases = [
+        (
+            '<tool_call>{"name":"read","arguments":{"path":"README.md"}}</tool_call>',
+            [{"name": "read", "arguments": {"path": "README.md"}}],
+        ),
+        (
+            '```json\n{"name":"bash","arguments":{"cmd":"date",}}\n```',
+            [{"name": "bash", "arguments": {"cmd": "date"}}],
+        ),
+        (
+            '{"tool_calls":[{"function":{"name":"grep","arguments":"{\\"query\\":\\"needle\\"}"}}]}',
+            [{"name": "grep", "arguments": {"query": "needle"}}],
+        ),
+        (
+            'Example only:\n```json\n{"name":"bash","arguments":{"cmd":"date"}}\n```',
+            [],
+        ),
+    ]
+    failures = 0
+    for text, expected in cases:
+        if _try_extract_tool_calls_from_text(text) != expected:
+            failures += 1
+    if failures:
+        return Check("tool parser", "fail", f"{failures}/{len(cases)} parser probes failed")
+    return Check("tool parser", "ok", f"{len(cases)} parser probes passed")
 
 
 def _writable(name: str, path: Path) -> Check:

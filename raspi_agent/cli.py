@@ -19,7 +19,9 @@ from .agent import Agent, build_agent
 from .config import CONFIG, Config
 from .doctor import run_checks
 from .llm import TIER_FAST, TIER_REASONER
+from .longrun import LongRunOptions, run_research
 from .memory.consolidate import consolidate
+from .memory.store import Store
 
 console = Console()
 
@@ -165,6 +167,21 @@ def cmd_dashboard(agent: Agent) -> None:
     confirm_set = ", ".join(agent.d.cfg.confirm_tools) or "(none)"
     table.add_row("confirm-on", confirm_set)
     console.print(table)
+    stats = agent.d.store.tool_success_stats()
+    if stats:
+        tool_table = Table(title="tool success", show_header=True)
+        tool_table.add_column("tool")
+        tool_table.add_column("ok", justify="right")
+        tool_table.add_column("fail", justify="right")
+        tool_table.add_column("rate", justify="right")
+        for row in stats:
+            tool_table.add_row(
+                row["name"],
+                str(row["ok"]),
+                str(row["fail"]),
+                f"{row['rate'] * 100:.0f}%",
+            )
+        console.print(tool_table)
 
 
 def cmd_resume(agent: Agent, sid: str | None) -> None:
@@ -233,6 +250,132 @@ def cmd_tune() -> int:
         return 2
     console.print(f"[dim]running {script}…[/dim]")
     return subprocess.call(["bash", str(script)])
+
+
+def cmd_runs(cfg: Config) -> int:
+    cfg.ensure_dirs()
+    store = Store(cfg.db_path)
+    try:
+        rows = store.list_long_runs(limit=30)
+    finally:
+        store.close()
+    if not rows:
+        console.print("[dim]no long-running research runs yet[/dim]")
+        return 0
+    table = Table(title="long runs", show_header=True)
+    table.add_column("id")
+    table.add_column("status")
+    table.add_column("cycles", justify="right")
+    table.add_column("age", justify="right")
+    table.add_column("topic")
+    for row in rows:
+        max_cycles = row.get("max_cycles")
+        cycle_text = f"{row['cycles']}/{max_cycles if max_cycles is not None else 'inf'}"
+        table.add_row(
+            row["id"],
+            row["status"],
+            cycle_text,
+            _fmt_age(float(row["updated_at"])),
+            _short(row["topic"]),
+        )
+    console.print(table)
+    return 0
+
+
+def cmd_run_status(cfg: Config, run_id: str) -> int:
+    cfg.ensure_dirs()
+    store = Store(cfg.db_path)
+    try:
+        run = store.get_long_run(run_id)
+        events = store.long_run_events(run_id, limit=20) if run else []
+    finally:
+        store.close()
+    if not run:
+        console.print(f"[red]unknown long run: {run_id}[/red]")
+        return 2
+    state = run.get("state") or {}
+    max_cycles = run.get("max_cycles")
+    lanes = state.get("lanes") or []
+    lane_text = "\n".join(
+        f"- {lane.get('id')}: {lane.get('title')} [{lane.get('status')}]"
+        for lane in lanes
+    ) or "(none)"
+    console.print(Panel(
+        f"[bold]{run['topic']}[/bold]\n"
+        f"status={run['status']} cycles={run['cycles']}/"
+        f"{max_cycles if max_cycles is not None else 'inf'}\n\n"
+        f"[bold]lanes[/bold]\n{lane_text}",
+        title=f"long run {run_id}",
+        border_style="cyan",
+    ))
+    if events:
+        table = Table(title="recent events", show_header=True)
+        table.add_column("age", justify="right")
+        table.add_column("kind")
+        table.add_column("content")
+        for event in events[-12:]:
+            table.add_row(
+                _fmt_age(float(event["ts"])),
+                event["kind"],
+                _short(str(event["content"]).replace("\n", " ")),
+            )
+        console.print(table)
+    return 0
+
+
+def cmd_research(args: argparse.Namespace, cfg: Config, cancel_event: threading.Event) -> int:
+    interval = max(0.0, float(args.research_interval))
+    if args.forever and interval <= 0:
+        interval = 60.0
+        console.print("[dim]--forever uses a 60s interval unless --research-interval is set[/dim]")
+    opts = LongRunOptions(
+        cycles=max(0, int(args.research_cycles)),
+        interval_s=interval,
+        max_child_lanes=max(0, int(args.research_child_agents)),
+        forever=bool(args.forever),
+        compact_every=max(0, int(args.research_compact_every)),
+        tier=args.tier,
+    )
+
+    def on_cycle(event: str, payload: dict) -> None:
+        if event == "start":
+            run = payload["run"]
+            lane = payload["lane"]
+            console.print(
+                f"[cyan]research {run['id']} cycle {payload['cycle']} "
+                f"lane {lane.get('id')}[/cyan] [dim]{lane.get('title')}[/dim]"
+            )
+        elif event == "done":
+            answer = str(payload.get("answer") or "").strip().replace("\n", " ")
+            console.print(f"[green]cycle {payload['cycle']} done[/green] [dim]{_short(answer)}[/dim]")
+        elif event == "sleep":
+            console.print(f"[dim]sleeping {payload['seconds']:.0f}s before next cycle[/dim]")
+        elif event == "stop":
+            run = payload["run"]
+            console.print(
+                f"[cyan]run {run['id']} {run['status']} after "
+                f"{payload.get('cycles_done', 0)} cycle(s) this invocation[/cyan]"
+            )
+
+    try:
+        run = run_research(
+            cfg,
+            topic=args.research,
+            run_id=args.continue_run,
+            options=opts,
+            on_cycle=on_cycle,
+            on_tool_call=render_tool_call,
+            cancel=cancel_event,
+        )
+    except KeyboardInterrupt:
+        cancel_event.set()
+        console.print("\n[yellow]research paused by interrupt[/yellow]")
+        return 130
+    except Exception as e:
+        console.print(f"[red]research run failed: {e}[/red]")
+        return 2
+    console.print(f"[dim]inspect later with: raspi --run-status {run['id']}[/dim]")
+    return 0
 
 
 def handle_slash(agent: Agent, line: str, session_state: dict) -> bool:
@@ -310,6 +453,25 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--sandbox", choices=("auto", "on", "off"), help="bubblewrap shell sandbox mode")
     parser.add_argument("--resume", nargs="?", const="", help="resume the most recent (or named) session")
     parser.add_argument("--no-stream", action="store_true", help="disable streaming output for final answers")
+    parser.add_argument("--research", metavar="TOPIC", help="start a controlled long-running research run")
+    parser.add_argument("--continue-run", metavar="ID", help="continue a long-running research run")
+    parser.add_argument("--runs", action="store_true", help="list long-running research runs")
+    parser.add_argument("--run-status", metavar="ID", help="show a long-running research run")
+    parser.add_argument("--research-cycles", type=int, default=3, help="cycles to run now")
+    parser.add_argument("--research-interval", type=float, default=0.0, help="seconds between cycles")
+    parser.add_argument(
+        "--research-child-agents",
+        type=int,
+        default=3,
+        help="maximum active child-agent lanes per run",
+    )
+    parser.add_argument(
+        "--research-compact-every",
+        type=int,
+        default=4,
+        help="run memory consolidation every N research cycles (0 disables)",
+    )
+    parser.add_argument("--forever", action="store_true", help="keep a research run cycling until interrupted")
     return parser.parse_args(argv)
 
 
@@ -439,9 +601,16 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_tune()
     if args.doctor:
         return cmd_doctor(cfg, json_out=args.json)
+    if args.runs:
+        return cmd_runs(cfg)
+    if args.run_status:
+        return cmd_run_status(cfg, args.run_status)
 
     session_state: dict = {"yolo": False}
     cancel_event = threading.Event()
+
+    if args.research or args.continue_run:
+        return cmd_research(args, cfg, cancel_event)
 
     def confirm_shell(cmd: str) -> bool:
         if session_state.get("yolo"):

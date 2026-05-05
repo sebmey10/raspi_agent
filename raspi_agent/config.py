@@ -213,6 +213,12 @@ class Config:
     plan_prompt_chars: int = field(
         default_factory=lambda: _env_int("RASPI_PLAN_PROMPT_CHARS", None, 1500)
     )
+    context_prompt_chars: int = field(
+        default_factory=lambda: _env_int("RASPI_CONTEXT_PROMPT_CHARS", None, 1500)
+    )
+    repo_instructions_chars: int = field(
+        default_factory=lambda: _env_int("RASPI_REPO_INSTRUCTIONS_CHARS", None, 4000)
+    )
     history_prompt_chars: int = field(
         default_factory=lambda: _env_int(
             "RASPI_HISTORY_PROMPT_CHARS", "RASP_HISTORY_PROMPT_CHARS", 7000
@@ -286,6 +292,10 @@ class Config:
     @property
     def scratchpad_path(self) -> Path:
         return self.workspace_state_dir / "scratchpad.md"
+
+    @property
+    def context_path(self) -> Path:
+        return self.workspace_state_dir / "context.md"
 
     def ensure_dirs(self) -> None:
         for p in [self.data_dir, self.memory_dir, self.wiki_snapshots_dir,

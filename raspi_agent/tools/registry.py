@@ -260,6 +260,50 @@ def build_tools(workspace: Path, shell: ShellGate) -> dict[str, Tool]:
             # handler is wired by Agent at build time (needs scratchpad ref).
             handler=lambda args: "<placeholder: bound at agent build time>",
         ),
+        "todo_update": Tool(
+            name="todo_update",
+            description=(
+                "Update one step in the active plan as pending, doing, done, or blocked. "
+                "Use this after completing or blocking a plan step."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "step": {"type": "integer", "minimum": 1},
+                    "status": {"type": "string", "enum": ["pending", "doing", "done", "blocked"]},
+                    "note": {"type": "string"},
+                },
+                "required": ["step", "status"],
+            },
+            handler=lambda args: "<placeholder: bound at agent build time>",
+        ),
+        "context_update": Tool(
+            name="context_update",
+            description=(
+                "Append a compact note to `<workspace>/.raspi/context.md`. Use after "
+                "important observations, decisions, failed attempts, inspected files, "
+                "or next steps so long tasks survive context compaction."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "section": {
+                        "type": "string",
+                        "enum": [
+                            "Task",
+                            "Constraints",
+                            "Files Inspected",
+                            "Decisions",
+                            "Failed Attempts",
+                            "Next Steps",
+                        ],
+                    },
+                    "note": {"type": "string", "description": "one compact bullet-worthy note"},
+                },
+                "required": ["section", "note"],
+            },
+            handler=lambda args: "<placeholder: bound at agent build time>",
+        ),
         "remember": Tool(
             name="remember",
             description=(

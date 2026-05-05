@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import re
 import selectors
 import shutil
 import subprocess
@@ -11,6 +13,23 @@ MAX_READ_BYTES = 2 * 1024 * 1024
 MAX_WRITE_BYTES = 1 * 1024 * 1024
 MAX_SEARCH_BYTES = 512 * 1024
 SKIP_DIRS = {".git", ".venv", "__pycache__", ".mypy_cache", ".pytest_cache", "node_modules"}
+SENSITIVE_FILENAMES = {
+    ".env",
+    ".env.local",
+    ".envrc",
+    ".npmrc",
+    ".pypirc",
+    ".netrc",
+    "id_rsa",
+    "id_dsa",
+    "id_ecdsa",
+    "id_ed25519",
+}
+SECRET_VALUE_RE = re.compile(
+    r"(?i)\b(api[_-]?key|token|secret|password|passwd|pwd|private[_-]?key|access[_-]?key)\b"
+    r"(\s*[:=]\s*)"
+    r"([^\s#]+)"
+)
 
 
 def _resolve_in(workspace: Path, raw: str) -> Path:
@@ -35,6 +54,9 @@ def read(workspace: Path, path: str, max_lines: int = 2000, start_line: int = 1)
     p = _resolve_in(workspace, path)
     if not p.exists():
         return f"<error>file not found: {path}</error>"
+    if _is_sensitive_path(p):
+        return (f"<error>sensitive file blocked: {path} "
+                "(set RASPI_ALLOW_SECRETS=1 only if you really need this)</error>")
     if p.is_dir():
         items = sorted(c.name + ("/" if c.is_dir() else "") for c in p.iterdir())
         return f"<dir path={path}>\n" + "\n".join(items) + "\n</dir>"
@@ -48,7 +70,7 @@ def read(workspace: Path, path: str, max_lines: int = 2000, start_line: int = 1)
     start_idx = start_line - 1
     selected = lines[start_idx:start_idx + max_lines]
     truncated = start_idx > 0 or start_idx + len(selected) < len(lines)
-    body = "\n".join(f"{i:>5}\t{ln}" for i, ln in enumerate(selected, start=start_line))
+    body = "\n".join(f"{i:>5}\t{_redact_secrets(ln)}" for i, ln in enumerate(selected, start=start_line))
     tag = f"<file path={path} start_line={start_line} total_lines={len(lines)}"
     if truncated:
         tag += " truncated=true"
@@ -136,13 +158,15 @@ def search(workspace: Path, query: str, path: str = ".", max_matches: int = 50) 
         try:
             if candidate.stat().st_size > MAX_SEARCH_BYTES:
                 continue
+            if _is_sensitive_path(candidate):
+                continue
             text = candidate.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
         for lineno, line in enumerate(text.splitlines(), start=1):
             if query in line:
                 rel = _rel(workspace, candidate)
-                lines.append(f"{rel}:{lineno}:{line}")
+                lines.append(f"{rel}:{lineno}:{_redact_secrets(line)}")
                 if len(lines) > max_matches:
                     truncated = True
                     break
@@ -216,12 +240,34 @@ def _format_matches(
     lines: list[str],
     truncated: bool,
 ) -> str:
-    normalized = [_normalize_match_path(workspace, line) for line in lines]
+    normalized = [_redact_secrets(_normalize_match_path(workspace, line)) for line in lines]
     attrs = f' query="{escape(query, quote=True)}" matches={len(normalized)}'
     if truncated:
         attrs += " truncated=true"
     body = "\n".join(normalized)
     return f"<search{attrs}>\n{body}\n</search>"
+
+
+def _allow_secrets() -> bool:
+    for var in ("RASPI_ALLOW_SECRETS", "RASP_ALLOW_SECRETS"):
+        if os.environ.get(var, "").strip().lower() in {"1", "true", "yes", "on"}:
+            return True
+    return False
+
+
+def _is_sensitive_path(path: Path) -> bool:
+    if _allow_secrets():
+        return False
+    name = path.name.lower()
+    if name in SENSITIVE_FILENAMES:
+        return True
+    if name.endswith((".pem", ".key", ".p12", ".pfx")):
+        return True
+    return any(part.lower() in {".ssh", ".gnupg"} for part in path.parts)
+
+
+def _redact_secrets(line: str) -> str:
+    return SECRET_VALUE_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}<redacted>", line)
 
 
 def _normalize_match_path(workspace: Path, line: str) -> str:

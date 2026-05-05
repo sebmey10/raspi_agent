@@ -15,12 +15,21 @@ rewrites itself nightly, and tier-escalating local models on Ollama.
   that pins the user's prompt and writes `<workspace>/.raspi/plan.md`. Every
   4 tool loops the model runs a one-word reflect (`keep` / `replan` /
   `give_up`). Default `MAX_TOOL_LOOPS=12`, smarter dedupe (normalized args).
+- **Repo instructions discovery**. Workspace `AGENTS.md` or `RASPI.md` files are
+  loaded into the prompt as cheap, local project guidance.
 - **Streaming output**. Final-answer turns stream tokens to stdout via
   `rich`. Ctrl-C cancels both the in-flight LLM stream and any tool
   subprocess.
 - **Context compaction**. When transcript hits 80% of the history budget,
   the fast tier summarizes the oldest half into one synthetic turn — long
   Pi sessions stop collapsing.
+- **Context ledger**. `context_update` maintains `<workspace>/.raspi/context.md`
+  with compact facts about inspected files, decisions, failed attempts, and
+  next steps. It is injected with the plan so long tasks survive compaction.
+- **Long-run research/project mode**. `raspi --research "topic"` creates a
+  resumable SQLite-backed run with cycle summaries, event history, periodic
+  consolidation, and bounded child-agent lanes via a run-scoped `child_agent`
+  tool. Use `--forever` for all-day iteration; it pauses cleanly on Ctrl-C.
 - **Edit ladder**. The model picks the right tool: `ast_edit` (Python/JS via
   tree-sitter, parse-checked) → `apply_patch` (unified diff via stdlib
   `difflib`) → `edit` (single literal replace) → `write` (full overwrite,
@@ -41,7 +50,8 @@ rewrites itself nightly, and tier-escalating local models on Ollama.
   skips prompts for the session, `/strict` re-enables.
 - **Doctor v2**. `raspi --doctor [--json]` probes Ollama, models, Pi
   thermals, throttle bits, governor, swappiness, sandbox, tree-sitter,
-  prompt budgets, threads. Exit codes: 0 ok, 1 warn, 2 fail.
+  tool-call parser recovery, prompt budgets, threads. Exit codes: 0 ok, 1 warn,
+  2 fail.
 - **Session resume**. `raspi resume` (or `/resume`) reloads the most recent
   session's history into the new agent.
 - **MCP-ready interface**. `Tool.source` field is in place; v0.4 ships an
@@ -56,6 +66,7 @@ bash scripts/install.sh        # uv tool install if available, else pipx, else .
 raspi --tune                   # cpu governor=performance, swappiness=1
 raspi --doctor                 # verify sandbox, models, Pi health
 raspi                          # interactive REPL
+raspi --research "robotics papers for local agents" --forever --research-interval 300
 ```
 
 The installer:
@@ -107,11 +118,28 @@ tags. If not, it falls back to whatever you have and warns.
 | `/resume [sid]`   | reload most recent (or named) session into history |
 | `/quit`           | exit (saves session, runs journal entry)           |
 
+## Long-running research
+
+```bash
+raspi --research "make this repo smarter" --research-cycles 6
+raspi --research "watch new local-agent repos" --forever --research-interval 300
+raspi --runs
+raspi --run-status <id>
+raspi --continue-run <id> --research-cycles 3
+```
+
+Each cycle is one normal bounded Agent turn: same tool loop cap, reflection,
+shell sandbox, secret hygiene, and context compaction. The supervisor stores
+compressed cycle summaries in `long_runs`, stores an event stream in
+`long_run_events`, and exposes a run-only `child_agent` tool so the model can
+split work into durable lanes without recursively spawning unlimited processes.
+`--forever` defaults to a 60s interval if you do not provide one.
+
 ## Layout
 
 ```
 data/
-  db.sqlite              # episodic turns, dreams, kv
+  db.sqlite              # turns, dreams, kv, long_runs, long_run_events
   memory/
     WIKI.md              # canonical long-term memory
     _snapshots/          # pre-dream backups
@@ -148,10 +176,13 @@ All `RASPI_*` vars also accept the legacy `RASP_*` name for one release.
 | `RASPI_HISTORY_PROMPT_CHARS`     | `7000`                   | recent-transcript budget                          |
 | `RASPI_WIKI_PROMPT_CHARS`        | `9000`                   | wiki memory budget                                |
 | `RASPI_PLAN_PROMPT_CHARS`        | `1500`                   | plan-file injection budget                        |
+| `RASPI_CONTEXT_PROMPT_CHARS`     | `1500`                   | context-ledger injection budget                   |
+| `RASPI_REPO_INSTRUCTIONS_CHARS`  | `4000`                   | repo instruction file prompt budget               |
 | `RASPI_TOOL_RESULT_CHARS`        | `5000`                   | clip per-tool result before history               |
 | `RASPI_DREAM_MAX_TURNS`          | `256`                    | max turns per nightly consolidation               |
 | `RASPI_DREAM_TRANSCRIPT_CHARS`   | `24000`                  | dream transcript budget                           |
 | `RASPI_WEB_ALLOW_PRIVATE`        | `false`                  | allow `web_fetch` to reach localhost / RFC1918    |
+| `RASPI_ALLOW_SECRETS`            | `false`                  | allow tools to read likely secret files           |
 | `RASPI_AUTO_DREAM_ON_EXIT`       | `false`                  | run consolidation on exit                         |
 | `RASPI_NPU`                      | `off`                    | `off` or `hailo` (Hailo path is a v0.4 stub)      |
 
@@ -169,8 +200,13 @@ All `RASPI_*` vars also accept the legacy `RASP_*` name for one release.
 | `bash`       | allowlisted shell, bwrap-sandboxed when available                   |
 | `web_fetch`  | HTTPS fetch with private-IP guard                                   |
 | `todo_write` | write the per-session plan file                                     |
+| `todo_update` | mark active plan steps pending/doing/done/blocked                 |
+| `context_update` | append compact task-state facts to `.raspi/context.md`          |
 | `remember`   | append a bullet under a wiki H2 heading                             |
 | `forget`     | remove first wiki line containing a needle                          |
+
+Long-run mode also injects a runtime-only `child_agent` tool. It creates,
+updates, completes, or blocks bounded child-agent lanes for the active run.
 
 ## Notes on quantization (still relevant)
 
