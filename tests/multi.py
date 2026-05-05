@@ -2,7 +2,7 @@
 import time
 import sys
 
-from rasp_agent.agent import build_agent
+from raspi_agent.agent import build_agent
 
 
 def main() -> int:

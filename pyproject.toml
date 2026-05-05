@@ -3,9 +3,9 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "rasp-agent"
-version = "0.2.0"
-description = "On-board, memory-keeping coding agent for Raspberry Pi 5"
+name = "raspi-agent"
+version = "0.3.0"
+description = "On-board, memory-keeping coding agent for Raspberry Pi 5 — Claude-Code-shaped"
 requires-python = ">=3.11"
 authors = [{ name = "bashperry" }]
 dependencies = [
@@ -17,22 +17,30 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "ruff>=0.5"]
+ast = [
+    "tree-sitter>=0.23",
+    "tree-sitter-python>=0.23",
+    "tree-sitter-javascript>=0.23",
+]
 
 [project.scripts]
-rasp = "rasp_agent.cli:main"
-rasp-dream = "rasp_agent.memory.consolidate:cli_main"
+raspi = "raspi_agent.cli:main"
+raspi-dream = "raspi_agent.memory.consolidate:cli_main"
+# v0.2 back-compat aliases — removed in v0.4.
+rasp = "raspi_agent.cli:main"
+rasp-dream = "raspi_agent.memory.consolidate:cli_main"
 
 [tool.setuptools]
 packages = [
-    "rasp_agent",
-    "rasp_agent.memory",
-    "rasp_agent.tools",
-    "rasp_agent.prompts",
+    "raspi_agent",
+    "raspi_agent.memory",
+    "raspi_agent.tools",
+    "raspi_agent.prompts",
 ]
 include-package-data = true
 
 [tool.setuptools.package-data]
-"rasp_agent.prompts" = ["*.md"]
+"raspi_agent.prompts" = ["*.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

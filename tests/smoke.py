@@ -1,8 +1,8 @@
 """End-to-end smoke test: wiki memory + episodic store roundtrip."""
 
-from rasp_agent.config import CONFIG
-from rasp_agent.memory.store import Store
-from rasp_agent.memory.wiki import Wiki
+from raspi_agent.config import CONFIG
+from raspi_agent.memory.store import Store
+from raspi_agent.memory.wiki import Wiki
 
 
 def test_wiki_layer():

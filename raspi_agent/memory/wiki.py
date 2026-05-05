@@ -19,19 +19,21 @@ DEFAULT_HEADINGS: tuple[str, ...] = (
     "Active Projects",
     "Preferences",
     "References",
+    "Cheatsheet",
     "Notes",
     "Archive",
 )
 
 DEFAULT_BODY: dict[str, str] = {
     "Identity": (
-        "I am rasp, a small persistent coding agent on a Raspberry Pi. "
+        "I am raspi, a small persistent coding agent on a Raspberry Pi. "
         "I keep this wiki up to date as my long-term memory."
     ),
     "User": "(nothing yet — append facts about the user as you learn them)",
     "Active Projects": "(nothing yet)",
     "Preferences": "(nothing yet — collaboration style, tone, do/don't rules)",
     "References": "(nothing yet — pointers to external systems, URLs, channels)",
+    "Cheatsheet": "(nothing yet — short shell snippets the dream pass found useful)",
     "Notes": "(nothing yet — durable project notes that don't fit above)",
     "Archive": "(rotated content from past dream cycles lands here)",
 }
@@ -49,6 +51,10 @@ HEADING_ALIASES: dict[str, str] = {
     "references": "References",
     "link": "References",
     "links": "References",
+    "cheatsheet": "Cheatsheet",
+    "cheat": "Cheatsheet",
+    "snippet": "Cheatsheet",
+    "snippets": "Cheatsheet",
     "note": "Notes",
     "notes": "Notes",
     "user": "User",

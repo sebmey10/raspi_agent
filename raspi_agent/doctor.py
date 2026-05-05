@@ -33,15 +33,47 @@ def run_checks(cfg: Config) -> list[Check]:
     checks.extend(_pi_health_checks())
     checks.extend(_pi_tuning_checks())
     checks.append(Check("threads", "ok", f"num_thread={cfg.num_thread} cpu_count={os.cpu_count() or 'unknown'}"))
-    checks.append(Check("prompt budgets", "ok", f"wiki={cfg.wiki_prompt_chars} history={cfg.history_prompt_chars} chars"))
-    checks.append(Check("tools", "ok", f"native_tools={cfg.native_tools} think_fast={cfg.think_fast!r}"))
+    checks.append(Check("prompt budgets", "ok",
+                       f"wiki={cfg.wiki_prompt_chars} plan={cfg.plan_prompt_chars} "
+                       f"history={cfg.history_prompt_chars} chars"))
+    checks.append(Check("tools", "ok",
+                       f"native_tools={cfg.native_tools} think_fast={cfg.think_fast!r}"))
+    checks.append(_sandbox_check(cfg))
+    checks.append(_ast_edit_check())
     return checks
+
+
+def _sandbox_check(cfg: Config) -> Check:
+    if cfg.sandbox == "off":
+        return Check("sandbox", "warn", "RASPI_SANDBOX=off (bash runs un-sandboxed)")
+    bwrap = shutil.which("bwrap")
+    if bwrap is None:
+        if cfg.sandbox == "on":
+            return Check("sandbox", "fail", "RASPI_SANDBOX=on but bwrap not found (apt install bubblewrap)")
+        return Check("sandbox", "warn", "bwrap not installed; install bubblewrap for shell isolation")
+    try:
+        proc = subprocess.run([bwrap, "--version"], capture_output=True, text=True, timeout=5)
+        ver = (proc.stdout or proc.stderr).strip().splitlines()[0] if proc.returncode == 0 else "unknown"
+        return Check("sandbox", "ok", f"{bwrap} ({ver})")
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return Check("sandbox", "warn", f"bwrap probe failed: {e}")
+
+
+def _ast_edit_check() -> Check:
+    try:
+        from .tools import edit_ladder  # noqa: PLC0415 - feature probe
+    except Exception as e:  # pragma: no cover
+        return Check("ast_edit", "warn", f"edit_ladder import failed: {e}")
+    if edit_ladder.AST_AVAILABLE:
+        return Check("ast_edit", "ok", "tree-sitter Python+JS wheels detected")
+    return Check("ast_edit", "warn",
+                 "tree-sitter wheels missing; pip install raspi-agent[ast] to enable")
 
 
 def _writable(name: str, path: Path) -> Check:
     try:
         path.mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile(dir=path, prefix=".rasp-check-", delete=True) as f:
+        with tempfile.NamedTemporaryFile(dir=path, prefix=".raspi-check-", delete=True) as f:
             f.write(b"ok")
         return Check(name, "ok", str(path))
     except OSError as e:

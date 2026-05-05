@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import ipaddress
+import os
 import shlex
+import shutil
 import subprocess
 from pathlib import Path
 from urllib.parse import urlparse
@@ -12,15 +14,29 @@ DENIED_SHELL_PATTERNS = ("$(", "`", "\n", "\r")
 PATHY_COMMANDS = {"cat", "head", "tail", "wc", "grep", "rg", "find", "tree", "sed", "awk", "stat", "file"}
 PACKAGE_COMMANDS = {"pip", "npm", "pnpm", "yarn"}
 DESTRUCTIVE_GIT = {"clean", "reset", "checkout", "restore", "rebase"}
+NET_COMMANDS = {"curl", "wget", "git"}  # need --share-net under bwrap
 
 
 class ShellGate:
     def __init__(self, allowlist: tuple[str, ...], timeout: int, workspace: Path,
-                 confirm_callback=None):
+                 confirm_callback=None, sandbox_mode: str = "auto"):
         self.allowlist = set(allowlist)
         self.timeout = timeout
         self.workspace = workspace
         self.confirm = confirm_callback
+        self.sandbox_mode = sandbox_mode  # "auto" | "on" | "off"
+        self._bwrap_path = self._detect_bwrap()
+
+    def _detect_bwrap(self) -> str | None:
+        if self.sandbox_mode == "off":
+            return None
+        path = shutil.which("bwrap")
+        if path is None and self.sandbox_mode == "on":
+            return "bwrap"
+        return path
+
+    def sandbox_active(self) -> bool:
+        return self._bwrap_path is not None
 
     def _tokens(self, cmd: str) -> list[str]:
         lex = shlex.shlex(cmd, posix=True, punctuation_chars=True)
@@ -85,9 +101,10 @@ class ShellGate:
         try:
             run_args = self._tokens(cmd)
             use_shell = _needs_shell(run_args)
+            invocation, sh_flag = self._wrap_for_sandbox(cmd, run_args, use_shell)
             proc = subprocess.run(
-                cmd if use_shell else run_args,
-                shell=use_shell,
+                invocation,
+                shell=sh_flag,
                 cwd=self.workspace,
                 capture_output=True,
                 text=True,
@@ -103,6 +120,45 @@ class ShellGate:
         if len(combined) > MAX_OUTPUT:
             combined = combined[:MAX_OUTPUT] + f"\n<truncated at {MAX_OUTPUT} bytes>"
         return f"<sh exit={proc.returncode}>\n{combined}\n</sh>"
+
+    def _wrap_for_sandbox(self, cmd: str, run_args: list[str], use_shell: bool):
+        """Return (invocation, shell_flag) for subprocess.run.
+
+        Without bwrap: pass through (existing behaviour). With bwrap: build a
+        bubblewrap invocation that read-only-binds /, rw-binds the workspace,
+        unshares network by default, and routes shell-feature commands through
+        /bin/sh -c inside the sandbox.
+        """
+        if not self.sandbox_active():
+            return (cmd if use_shell else run_args, use_shell)
+        bwrap_args = self._bwrap_args(run_args)
+        inner = ["/bin/sh", "-c", cmd] if use_shell else run_args
+        return ([self._bwrap_path, *bwrap_args, *inner], False)
+
+    def _bwrap_args(self, run_args: list[str]) -> list[str]:
+        ws = str(self.workspace.resolve())
+        args = [
+            "--ro-bind", "/", "/",
+            "--bind", ws, ws,
+            "--proc", "/proc",
+            "--dev", "/dev",
+            "--tmpfs", "/tmp",
+            "--die-with-parent",
+        ]
+        gitconfig = Path.home() / ".gitconfig"
+        if gitconfig.exists():
+            args += ["--ro-bind", str(gitconfig), str(gitconfig)]
+        head = run_args[0] if run_args else ""
+        head_basename = head.rsplit("/", 1)[-1] if "/" in head else head
+        if head_basename in NET_COMMANDS:
+            args += ["--share-net"]
+        else:
+            args += ["--unshare-net"]
+        for var in ("HOME", "PATH", "LANG", "LC_ALL", "TERM", "USER"):
+            v = os.environ.get(var)
+            if v is not None:
+                args += ["--setenv", var, v]
+        return args
 
     def _risky_reason(self, tokens: list[str]) -> str | None:
         command: str | None = None

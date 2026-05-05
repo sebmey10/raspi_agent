@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import re
+import threading
 from dataclasses import dataclass
 from typing import Any, Iterator
 
@@ -87,10 +88,51 @@ def _single_json_payload(text: str) -> Any | None:
     try:
         obj, end = decoder.raw_decode(stripped)
     except json.JSONDecodeError:
-        return None
+        repaired = _repair_json(stripped)
+        if repaired is None or repaired == stripped:
+            return None
+        try:
+            obj, end = decoder.raw_decode(repaired)
+        except json.JSONDecodeError:
+            return None
+        if repaired[end:].strip():
+            return None
+        return obj
     if stripped[end:].strip():
         return None
     return obj
+
+
+_TRAILING_COMMA_RE = re.compile(r",(\s*[}\]])")
+
+
+def _repair_json(text: str) -> str | None:
+    """Best-effort fixes for the JSON shapes small models botch:
+    - trailing commas before `}` or `]`
+    - dangling backticks / fence remnants
+    - missing closing braces/brackets at the end (greedy truncation)
+
+    Returns the repaired string or None if nothing usable.
+    """
+    s = text.strip()
+    if not s:
+        return None
+    if s.startswith("```"):
+        nl = s.find("\n")
+        if nl >= 0:
+            s = s[nl + 1:]
+        if s.rstrip().endswith("```"):
+            s = s.rstrip()[:-3].rstrip()
+    if not s:
+        return None
+    fixed = _TRAILING_COMMA_RE.sub(r"\1", s)
+    open_b = fixed.count("{") - fixed.count("}")
+    open_s = fixed.count("[") - fixed.count("]")
+    if open_b > 0:
+        fixed = fixed + ("}" * open_b)
+    if open_s > 0:
+        fixed = fixed + ("]" * open_s)
+    return fixed
 
 
 def _only_fenced_json(text: str) -> str | None:
@@ -263,20 +305,40 @@ class OllamaClient:
         messages: list[dict],
         ctx: int,
         temperature: float = 0.4,
+        num_predict: int | None = None,
+        num_thread: int | None = None,
         think: bool | str | None = None,
-    ) -> Iterator[str]:
-        payload = {
+        cancel: threading.Event | None = None,
+    ) -> Iterator[dict]:
+        """Stream a chat response. Yields dicts:
+            {"chunk": str}   on each text fragment
+            {"done": dict}   once with the final raw object (for stats)
+            {"cancelled": True} if `cancel.set()` is signalled mid-stream
+
+        Tools are intentionally not supported on the streaming path — the agent
+        only streams the final-answer turn.
+        """
+        opts: dict[str, Any] = {"num_ctx": ctx, "temperature": temperature}
+        if num_predict is not None:
+            opts["num_predict"] = num_predict
+        if num_thread is not None:
+            opts["num_thread"] = num_thread
+        unsupported = self._unsupported.get(model, set())
+        payload: dict[str, Any] = {
             "model": model,
             "messages": messages,
             "stream": True,
             "keep_alive": self.keep_alive,
-            "options": {"num_ctx": ctx, "temperature": temperature},
+            "options": opts,
         }
-        if think is not None:
+        if think is not None and "think" not in unsupported:
             payload["think"] = think
         with self.client.stream("POST", f"{self.base_url}/api/chat", json=payload) as r:
             r.raise_for_status()
             for line in r.iter_lines():
+                if cancel is not None and cancel.is_set():
+                    yield {"cancelled": True}
+                    return
                 if not line:
                     continue
                 try:
@@ -285,9 +347,10 @@ class OllamaClient:
                     continue
                 chunk = (obj.get("message") or {}).get("content", "")
                 if chunk:
-                    yield chunk
+                    yield {"chunk": chunk}
                 if obj.get("done"):
-                    break
+                    yield {"done": obj}
+                    return
 
     def close(self) -> None:
         self.client.close()
@@ -324,12 +387,20 @@ class Brain:
     def supports_tools(self, tier: str) -> bool:
         return self.client.supports_tools(self.models[tier])
 
-    def stream(self, messages: list[dict], tier: str) -> Iterator[str]:
+    def stream(
+        self,
+        messages: list[dict],
+        tier: str,
+        cancel: threading.Event | None = None,
+    ) -> Iterator[dict]:
         return self.client.stream_chat(
             model=self.models[tier],
             messages=messages,
             ctx=self.ctx[tier],
+            num_predict=self.num_predict[tier],
+            num_thread=self.num_thread,
             think=self.think[tier],
+            cancel=cancel,
         )
 
     def warm(self, tier: str) -> None:

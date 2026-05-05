@@ -3,16 +3,17 @@ from __future__ import annotations
 from dataclasses import replace
 from pathlib import Path
 
-from rasp_agent.agent import Agent, AgentDeps
-from rasp_agent.config import CONFIG
-from rasp_agent.doctor import _decode_throttled
-from rasp_agent.llm import LLMResponse, TIER_FAST, TIER_REASONER, _try_extract_tool_calls_from_text
-from rasp_agent.memory.store import Store
-from rasp_agent.memory.wiki import Wiki
-from rasp_agent.tools import fs
-from rasp_agent.tools.registry import Tool, build_tools
-from rasp_agent.tools.shell import ShellGate
-from rasp_agent.tools.web import _validate_url
+from raspi_agent.agent import Agent, AgentDeps
+from raspi_agent.config import CONFIG
+from raspi_agent.doctor import _decode_throttled
+from raspi_agent.llm import LLMResponse, TIER_FAST, TIER_REASONER, _repair_json, _try_extract_tool_calls_from_text
+from raspi_agent.memory.scratchpad import Scratchpad
+from raspi_agent.memory.store import Store
+from raspi_agent.memory.wiki import Wiki
+from raspi_agent.tools import fs
+from raspi_agent.tools.registry import Tool, build_tools
+from raspi_agent.tools.shell import ShellGate
+from raspi_agent.tools.web import _validate_url
 
 
 def test_extracts_nested_tool_json_from_xml_block():
@@ -159,12 +160,17 @@ def test_agent_synthesizes_final_answer_after_max_tool_loops(tmp_path: Path):
         workspace=tmp_path / "ws",
         native_tools="on",
         max_history_messages=12,
+        max_tool_loops=3,
+        reflect_every=0,
+        sandbox="off",
     )
     cfg.ensure_dirs()
     brain = _LoopingBrain()
     store = Store(cfg.db_path)
     wiki = Wiki(cfg.wiki_path)
-    shell = ShellGate((), timeout=5, workspace=cfg.workspace)
+    scratch = Scratchpad.from_workspace(cfg.workspace)
+    scratch.start_session()
+    shell = ShellGate((), timeout=5, workspace=cfg.workspace, sandbox_mode="off")
     tools = build_tools(cfg.workspace, shell)
     tools["noop"] = Tool(
         name="noop",
@@ -176,13 +182,32 @@ def test_agent_synthesizes_final_answer_after_max_tool_loops(tmp_path: Path):
         },
         handler=lambda args: f"<ok>{args['i']}</ok>",
     )
-    agent = Agent(AgentDeps(cfg, brain, store, wiki, tools, shell), store.start_session())
+    agent = Agent(
+        AgentDeps(cfg=cfg, brain=brain, store=store, wiki=wiki, scratch=scratch,
+                  tools=tools, shell=shell),
+        store.start_session(),
+    )
 
     try:
         assert agent.turn("keep going") == "final after tools"
         assert brain.calls == 4
     finally:
         store.close()
+
+
+def test_json_repair_fixes_trailing_commas_and_unbalanced_braces():
+    assert _repair_json('{"a": 1,}') == '{"a": 1}'
+    assert _repair_json('{"a": [1, 2,]}') == '{"a": [1, 2]}'
+    # missing closing brace
+    repaired = _repair_json('{"name":"bash","arguments":{"cmd":"date"}')
+    assert repaired is not None
+    assert repaired.endswith("}")
+
+
+def test_repaired_json_is_a_valid_tool_call_payload():
+    text = '{"name":"bash","arguments":{"cmd":"date",}'
+    calls = _try_extract_tool_calls_from_text(text)
+    assert calls == [{"name": "bash", "arguments": {"cmd": "date"}}]
 
 
 def test_decode_throttled_clean():

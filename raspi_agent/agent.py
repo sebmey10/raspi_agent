@@ -1,18 +1,34 @@
+"""raspi agent loop: Plan -> Act -> Reflect, with compaction and streaming.
+
+The agent runs a small open model on Ollama through a tier-escalating Brain.
+Each user message becomes a *task*: the model writes a `plan.md` (via
+`todo_write`) for non-trivial work, then iterates Act-Observe up to
+`cfg.max_tool_loops` times, with a Reflect checkpoint every
+`cfg.reflect_every` loops. Context-history compaction kicks in when the running
+transcript exceeds `cfg.compact_threshold_ratio * cfg.history_prompt_chars`.
+The final answer turn streams to stdout when a chunk callback is wired.
+"""
 from __future__ import annotations
 
+import json
+import threading
+import time
 from dataclasses import dataclass
 from typing import Callable
 
 from .config import CONFIG, Config
 from .llm import Brain, LLMResponse, TIER_FAST, TIER_REASONER
+from .memory.scratchpad import Scratchpad
 from .memory.store import Store
 from .memory.wiki import Wiki
 from .prompts import load as load_prompt
 from .tools.registry import Tool, build_tools, to_ollama_schema
 from .tools.shell import ShellGate
 
-MAX_TOOL_LOOPS = 3
-MAX_REPEAT_CALLS = 1  # same (name, args) tuple this many times -> break
+REFLECT_PROMPT = (
+    "[reflect-checkpoint] Reply with ONE word: `keep`, `replan`, or `give_up`. "
+    "Do not call any tools. Do not write anything else."
+)
 
 
 @dataclass
@@ -21,9 +37,12 @@ class AgentDeps:
     brain: Brain
     store: Store
     wiki: Wiki
+    scratch: Scratchpad
     tools: dict[str, Tool]
     shell: ShellGate
     on_tool_call: Callable[[str, dict, str], None] | None = None
+    on_chunk: Callable[[str], None] | None = None
+    cancel: threading.Event | None = None
 
 
 class Agent:
@@ -34,14 +53,23 @@ class Agent:
         self.fail_streak = 0
         self.forced_tier: str | None = None
         self.last_turn_stats: list[dict] = []
+        self.session_stats: dict = {
+            "prompt_tokens": 0,
+            "eval_tokens": 0,
+            "turns": 0,
+            "compactions": 0,
+            "tool_calls": 0,
+        }
         self._system_template = load_prompt("system.md")
         self._tools_summary_cache: str | None = None
         self._tools_schema_cache: list[dict] | None = None
         self._wiki_prompt_cache: tuple[int, int, str] | None = None
         self._native_tools_disabled: set[str] = set()
-        self._wire_memory_tools()
+        self._wire_handlers()
 
-    def _wire_memory_tools(self) -> None:
+    # ---- handler wiring ----
+
+    def _wire_handlers(self) -> None:
         def _remember(args: dict) -> str:
             heading = (args.get("heading") or "").strip()
             note = (args.get("note") or "").strip()
@@ -57,15 +85,28 @@ class Agent:
                 return "<error>missing field: needle</error>"
             return self.d.wiki.forget(needle)
 
+        def _todo_write(args: dict) -> str:
+            steps = args.get("steps") or []
+            if not isinstance(steps, list):
+                return "<error>steps must be an array of strings</error>"
+            steps = [str(s) for s in steps]
+            note = args.get("note")
+            if note is not None and not isinstance(note, str):
+                note = str(note)
+            return self.d.scratch.write_plan(steps, note)
+
         self.d.tools["remember"].handler = _remember
         self.d.tools["forget"].handler = _forget
+        self.d.tools["todo_write"].handler = _todo_write
+
+    # ---- prompt assembly ----
 
     def _system_message(self, tier: str) -> dict:
-        sys_template = self._system_template
         body = (
-            sys_template
+            self._system_template
             .replace("{workspace}", str(self.d.cfg.workspace))
             .replace("{wiki}", self._wiki_for_prompt())
+            .replace("{plan}", self._plan_for_prompt())
             .replace("{tools}", self._tools_summary())
             .replace("{tool_mode}", self._tool_mode_text(tier))
         )
@@ -84,15 +125,17 @@ class Agent:
         self._wiki_prompt_cache = (mtime, limit, rendered)
         return rendered
 
+    def _plan_for_prompt(self) -> str:
+        return self.d.scratch.render_for_prompt(self.d.cfg.plan_prompt_chars)
+
     def _tools_summary(self) -> str:
         if self._tools_summary_cache is not None:
             return self._tools_summary_cache
-        # One short line per tool — the model gets the full args from system.md
-        # examples plus the names/descriptions here. Verbose JSON schemas blow
-        # up prompt-eval time on a Pi without measurably improving tool calls.
-        lines = []
+        lines: list[str] = []
         for name, t in self.d.tools.items():
-            lines.append(f"- **{name}** — {t.description}")
+            if t.name == "ast_edit" and not t.extras.get("available", True):
+                continue
+            lines.append(f"- **{name}** - {t.description}")
         self._tools_summary_cache = "\n".join(lines)
         return self._tools_summary_cache
 
@@ -119,7 +162,7 @@ class Agent:
             return True
         return any(
             marker in model
-            for marker in ("qwen3", "llama3.1", "llama3.2", "llama3.3", "granite", "mistral")
+            for marker in ("qwen3", "qwen2.5", "llama3.1", "llama3.2", "llama3.3", "granite", "mistral")
         )
 
     def _pick_tier(self) -> str:
@@ -128,6 +171,8 @@ class Agent:
         if self.fail_streak >= self.d.cfg.fail_streak_to_escalate:
             return TIER_REASONER
         return TIER_FAST
+
+    # ---- history shaping ----
 
     def _context_history(self) -> list[dict]:
         budget = max(1000, self.d.cfg.history_prompt_chars)
@@ -149,22 +194,75 @@ class Agent:
             return text
         return text[:limit] + f"\n<truncated_for_prompt original_chars={len(text)}>"
 
-    def _record_stats(self, resp: LLMResponse) -> None:
-        raw = resp.raw or {}
+    def _compact_if_needed(self) -> None:
+        budget = max(1000, self.d.cfg.history_prompt_chars)
+        threshold = int(budget * self.d.cfg.compact_threshold_ratio)
+        used = sum(len(str(m.get("content", ""))) + 80 for m in self.history)
+        if used <= threshold or len(self.history) < 6:
+            return
+        keep_recent = max(4, len(self.history) // 2)
+        old = self.history[:-keep_recent]
+        recent = self.history[-keep_recent:]
+        if not old:
+            return
+        bullets: list[str] = []
+        for msg in old:
+            role = msg.get("role", "?")
+            text = str(msg.get("content", "")).strip().replace("\n", " ")
+            if not text:
+                continue
+            if role == "tool":
+                name = msg.get("name") or "tool"
+                bullets.append(f"- {name}-result: {text[:160]}")
+            else:
+                bullets.append(f"- [{role}] {text[:200]}")
+        synthetic = {
+            "role": "assistant",
+            "content": (
+                f"[compacted {len(old)} earlier turns to fit context]\n"
+                + "\n".join(bullets[:60])
+            ),
+        }
+        self.history = [synthetic] + recent
+        self.session_stats["compactions"] += 1
+
+    # ---- stats / dedupe ----
+
+    def _record_stats(self, raw: dict, tier: str) -> None:
         prompt_s = (raw.get("prompt_eval_duration") or 0) / 1_000_000_000
         eval_s = (raw.get("eval_duration") or 0) / 1_000_000_000
         load_s = (raw.get("load_duration") or 0) / 1_000_000_000
         prompt_tokens = raw.get("prompt_eval_count") or 0
         eval_tokens = raw.get("eval_count") or 0
         self.last_turn_stats.append({
-            "tier": resp.tier,
-            "model": raw.get("model", self.d.brain.models.get(resp.tier, "")),
+            "tier": tier,
+            "model": raw.get("model", self.d.brain.models.get(tier, "")),
             "prompt_tokens": prompt_tokens,
             "eval_tokens": eval_tokens,
             "prompt_tok_s": (prompt_tokens / prompt_s) if prompt_s else 0.0,
             "eval_tok_s": (eval_tokens / eval_s) if eval_s else 0.0,
             "load_s": load_s,
         })
+        self.session_stats["prompt_tokens"] += prompt_tokens
+        self.session_stats["eval_tokens"] += eval_tokens
+
+    def _record_response(self, resp: LLMResponse) -> None:
+        self._record_stats(resp.raw or {}, resp.tier)
+
+    @staticmethod
+    def _normalize_args(args: dict) -> str:
+        def norm(v):
+            if isinstance(v, str):
+                return v.strip()
+            if isinstance(v, list):
+                return [norm(x) for x in v]
+            if isinstance(v, dict):
+                return {k: norm(x) for k, x in sorted(v.items())}
+            return v
+        try:
+            return json.dumps(norm(args), sort_keys=True)
+        except (TypeError, ValueError):
+            return repr(args)
 
     def _tools_schema(self) -> list[dict]:
         if self._tools_schema_cache is None:
@@ -183,13 +281,16 @@ class Agent:
         for name, schema in props.items():
             if name not in clean:
                 continue
-            if schema.get("type") == "integer":
+            t = schema.get("type")
+            if t == "integer":
                 try:
                     clean[name] = int(clean[name])
                 except (TypeError, ValueError):
                     return clean, f"<error>field {name} must be an integer</error>"
-            elif schema.get("type") == "string" and not isinstance(clean[name], str):
+            elif t == "string" and not isinstance(clean[name], str):
                 clean[name] = str(clean[name])
+            elif t == "array" and not isinstance(clean[name], list):
+                return clean, f"<error>field {name} must be an array</error>"
         return clean, None
 
     def _tool_result_failed(self, result: str) -> bool:
@@ -199,32 +300,34 @@ class Agent:
             return not result.startswith("<sh exit=0>")
         return False
 
-    def _final_answer_after_tools(self, tier: str, reason: str) -> str:
-        self.history.append({
-            "role": "user",
-            "content": f"(system: {reason}; produce a final natural-language answer now, "
-                       "without calling any more tools)",
-        })
-        try:
-            final = self.d.brain.chat(
-                [self._system_message(tier)] + self._context_history(), None, tier
-            )
-            self._record_stats(final)
-            answer_text = final.content
-            self.d.store.append_turn(self.session_id, "assistant", answer_text, tier=tier)
-            return answer_text
-        except Exception as e:
-            return f"<llm-error>{e}</llm-error>"
+    # ---- turn entry point ----
 
     def turn(self, user_msg: str) -> str:
         self.last_turn_stats = []
+        self.session_stats["turns"] += 1
         self.d.store.append_turn(self.session_id, "user", user_msg)
         self.history.append({"role": "user", "content": user_msg})
+        self.d.scratch.begin_task(user_msg)
 
-        answer_text = ""
-        tier = self._pick_tier()
+        max_loops = max(1, self.d.cfg.max_tool_loops)
+        reflect_every = max(0, self.d.cfg.reflect_every)
         seen_calls: dict[tuple[str, str], int] = {}
-        for loop in range(MAX_TOOL_LOOPS):
+        tier = self._pick_tier()
+        answer_text = ""
+        exhausted = True
+
+        for loop in range(max_loops):
+            if self._cancelled():
+                return "<cancelled>"
+            self._compact_if_needed()
+
+            if reflect_every and loop > 0 and loop % reflect_every == 0:
+                decision = self._reflect(tier)
+                if decision == "give_up":
+                    answer_text = self._final_answer(tier, "you chose `give_up`")
+                    exhausted = False
+                    break
+
             sys_msg = self._system_message(tier)
             using_native_tools = self._use_native_tools(tier)
             tools_schema = self._tools_schema() if using_native_tools else None
@@ -241,7 +344,7 @@ class Agent:
                 self._native_tools_disabled.add(self.d.brain.models[tier].lower())
                 continue
 
-            self._record_stats(resp)
+            self._record_response(resp)
             self.history.append({
                 "role": "assistant",
                 "content": resp.content,
@@ -251,20 +354,23 @@ class Agent:
             self.d.store.append_turn(self.session_id, "assistant", resp.content, tier=tier)
 
             if not resp.tool_calls:
-                answer_text = resp.content
+                answer_text = self._maybe_restream(resp)
+                exhausted = False
                 break
 
             any_failed = False
             looped = False
-            import json as _json
             for tc in resp.tool_calls:
+                if self._cancelled():
+                    return "<cancelled>"
                 name = tc["name"]
                 args = tc["arguments"] or {}
-                key = (name, _json.dumps(args, sort_keys=True))
+                key = (name, self._normalize_args(args if isinstance(args, dict) else {}))
                 seen_calls[key] = seen_calls.get(key, 0) + 1
-                if seen_calls[key] > MAX_REPEAT_CALLS:
+                if seen_calls[key] > 1:
                     looped = True
-                    msg = f"<error>repeated call to {name}({args}); stop and answer the user</error>"
+                    msg = (f"<error>repeated call to {name}({args}); "
+                           f"stop and answer the user</error>")
                     self.d.store.append_turn(
                         self.session_id, "tool", msg, tool_name=name,
                         tool_args=args, tool_result=msg, tier=tier,
@@ -290,6 +396,7 @@ class Agent:
                 if self._tool_result_failed(result):
                     any_failed = True
 
+                self.session_stats["tool_calls"] += 1
                 if self.d.on_tool_call:
                     try:
                         self.d.on_tool_call(name, args, result)
@@ -307,7 +414,8 @@ class Agent:
                 })
 
             if looped:
-                answer_text = self._final_answer_after_tools(tier, "you repeated a tool call")
+                answer_text = self._final_answer(tier, "you repeated a tool call")
+                exhausted = False
                 break
 
             if any_failed:
@@ -316,17 +424,120 @@ class Agent:
                     tier = TIER_REASONER
             else:
                 self.fail_streak = 0
-        else:
+
+        if exhausted:
             self.fail_streak += 1
-            answer_text = self._final_answer_after_tools(tier, "max tool loops reached")
+            answer_text = self._final_answer(tier, "max tool loops reached")
 
         if self.fail_streak == 0 and tier == TIER_REASONER and not self.forced_tier:
             tier = TIER_FAST
 
         return answer_text
 
+    # ---- reflect / final-answer ----
 
-def build_agent(cfg: Config = CONFIG, on_tool_call=None, confirm_callback=None) -> tuple[Agent, AgentDeps]:
+    def _reflect(self, tier: str) -> str:
+        self.history.append({"role": "user", "content": REFLECT_PROMPT})
+        self.d.store.append_turn(self.session_id, "user", REFLECT_PROMPT, tier=tier)
+        try:
+            resp = self.d.brain.chat(
+                [self._system_message(tier)] + self._context_history(), None, tier
+            )
+        except Exception:
+            return "keep"
+        self._record_response(resp)
+        text = (resp.content or "").strip().lower()
+        self.history.append({"role": "assistant", "content": resp.content})
+        self.d.store.append_turn(self.session_id, "assistant", resp.content, tier=tier)
+        for choice in ("give_up", "replan", "keep"):
+            if choice in text:
+                return choice
+        return "keep"
+
+    def _final_answer(self, tier: str, reason: str) -> str:
+        self.history.append({
+            "role": "user",
+            "content": (f"(system: {reason}; produce a final natural-language answer now, "
+                        "without calling any more tools)"),
+        })
+        return self._chat_final(tier)
+
+    def _maybe_restream(self, resp: LLMResponse) -> str:
+        """Replay an already-produced final answer through the chunk hook so the
+        UI gets a streaming feel without a second LLM call."""
+        if self.d.on_chunk is None or not resp.content:
+            return resp.content
+        try:
+            for ch in resp.content:
+                if self._cancelled():
+                    break
+                self.d.on_chunk(ch)
+        except Exception:
+            pass
+        return resp.content
+
+    def _chat_final(self, tier: str) -> str:
+        sys_msg = self._system_message(tier)
+        messages = [sys_msg] + self._context_history()
+        if self.d.on_chunk is not None and hasattr(self.d.brain, "stream"):
+            try:
+                buf: list[str] = []
+                final_raw: dict = {}
+                for event in self.d.brain.stream(messages, tier, cancel=self.d.cancel):
+                    if event.get("cancelled"):
+                        break
+                    chunk = event.get("chunk")
+                    if chunk:
+                        buf.append(chunk)
+                        try:
+                            self.d.on_chunk(chunk)
+                        except Exception:
+                            pass
+                    elif "done" in event:
+                        final_raw = event["done"]
+                if final_raw:
+                    self._record_stats(final_raw, tier)
+                text = "".join(buf)
+                if text:
+                    self.history.append({"role": "assistant", "content": text})
+                    self.d.store.append_turn(self.session_id, "assistant", text, tier=tier)
+                    return text
+            except Exception:
+                pass
+        try:
+            final = self.d.brain.chat(messages, None, tier)
+            self._record_response(final)
+            text = final.content
+            self.history.append({"role": "assistant", "content": text})
+            self.d.store.append_turn(self.session_id, "assistant", text, tier=tier)
+            return text
+        except Exception as e:
+            return f"<llm-error>{e}</llm-error>"
+
+    def _cancelled(self) -> bool:
+        return self.d.cancel is not None and self.d.cancel.is_set()
+
+    # ---- session lifecycle ----
+
+    def end_session(self) -> None:
+        try:
+            stamp = time.strftime("%Y-%m-%d %H:%M")
+            tools_used = self.session_stats.get("tool_calls", 0)
+            turns = self.session_stats.get("turns", 0)
+            note = (f"{stamp} - session {self.session_id}: {turns} turns, "
+                    f"{tools_used} tool calls")
+            self.d.wiki.append("Notes", note)
+        except Exception:
+            pass
+
+
+def build_agent(
+    cfg: Config = CONFIG,
+    on_tool_call=None,
+    on_chunk=None,
+    confirm_callback=None,
+    cancel: threading.Event | None = None,
+) -> tuple[Agent, AgentDeps]:
     cfg.ensure_dirs()
     from .llm import OllamaClient
     client = OllamaClient(cfg.ollama_url, cfg.keep_alive)
@@ -341,13 +552,22 @@ def build_agent(cfg: Config = CONFIG, on_tool_call=None, confirm_callback=None) 
     )
     store = Store(cfg.db_path)
     wiki = Wiki(cfg.wiki_path)
+    scratch = Scratchpad.from_workspace(cfg.workspace)
+    scratch.start_session()
 
     def confirm(cmd: str) -> bool:
         return bool(confirm_callback and confirm_callback(cmd))
 
-    shell = ShellGate(cfg.bash_allowlist, cfg.bash_timeout, cfg.workspace, confirm)
+    shell = ShellGate(
+        cfg.bash_allowlist, cfg.bash_timeout, cfg.workspace, confirm,
+        sandbox_mode=cfg.sandbox,
+    )
     tools = build_tools(cfg.workspace, shell)
-    deps = AgentDeps(cfg, brain, store, wiki, tools, shell, on_tool_call)
+    deps = AgentDeps(
+        cfg=cfg, brain=brain, store=store, wiki=wiki, scratch=scratch,
+        tools=tools, shell=shell,
+        on_tool_call=on_tool_call, on_chunk=on_chunk, cancel=cancel,
+    )
     sid = store.start_session()
     agent = Agent(deps, sid)
     return agent, deps

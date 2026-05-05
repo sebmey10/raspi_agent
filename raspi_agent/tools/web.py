@@ -19,7 +19,7 @@ def fetch(url: str) -> str:
         with httpx.Client(
             follow_redirects=False,
             timeout=20,
-            headers={"User-Agent": "rasp-agent/0.2"},
+            headers={"User-Agent": "raspi-agent/0.3"},
         ) as client:
             current = url
             for _ in range(6):
@@ -82,7 +82,10 @@ def _validate_url(url: str) -> str | None:
 
 
 def _private_web_allowed() -> bool:
-    return os.environ.get("RASP_WEB_ALLOW_PRIVATE", "").strip().lower() in {"1", "true", "yes", "on"}
+    for var in ("RASPI_WEB_ALLOW_PRIVATE", "RASP_WEB_ALLOW_PRIVATE"):
+        if os.environ.get(var, "").strip().lower() in {"1", "true", "yes", "on"}:
+            return True
+    return False
 
 
 _TAG = re.compile(r"<[^>]+>")
